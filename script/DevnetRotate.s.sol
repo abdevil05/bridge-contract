@@ -36,7 +36,7 @@ contract DevnetRotate is Script {
     ///          decoding hint, and the only honest way to get it is to try both.
     function _assemble(bytes32 digest, bytes memory rs, address expect)
         internal
-        view
+        pure
         returns (bytes memory)
     {
         require(rs.length == 64, "ROTATE_RS must be exactly 64 bytes (r||s)");
@@ -89,7 +89,7 @@ contract DevnetRotate is Script {
         console2.log("incoming signer :", newSigner);
         console2.log("new keyEpoch    :", uint256(newEpoch));
 
-        // Fail loudly here rather than let the contract's StaleEpoch/BadSigner do it —
+        // Fail loudly here rather than let the contract's InvalidEpoch/BadSigner do it —
         // a local require names the actual mistake.
         require(newEpoch > curEpoch, "NEW_KEY_EPOCH must be strictly greater than keyEpoch");
         require(newSigner != address(0), "NEW_SIGNER is the zero address");
@@ -119,7 +119,10 @@ contract DevnetRotate is Script {
         console2.log("  vetoed           :", w.rotationVetoed());
 
         // The contract must NOT have switched yet — that is the whole point of H.6.2.
-        require(w.currentSigner() == outgoing, "currentSigner moved at propose time - challenge window is not being honoured");
+        require(
+            w.currentSigner() == outgoing,
+            "currentSigner moved at propose time - challenge window is not being honoured"
+        );
         require(w.keyEpoch() == curEpoch, "keyEpoch moved at propose time");
         console2.log("  currentSigner unchanged during the challenge window - correct");
     }
@@ -141,8 +144,15 @@ contract DevnetRotate is Script {
         console2.log("pendingSigner    :", pending);
         require(pending != address(0), "no pending rotation - run propose() first");
 
+        bytes memory ars = vm.envBytes("ACTIVATE_RS");
+        bytes32 actDigest = keccak256(
+            abi.encode(w.ACTIVATE_TAG(), block.chainid, address(w), pendingEpoch, pending)
+        );
+        console2.log("activate digest :", vm.toString(actDigest));
+        bytes memory incomingSig = _assemble(actDigest, ars, pending);
+
         vm.startBroadcast();
-        w.activateRotation();
+        w.activateRotation(incomingSig);
         vm.stopBroadcast();
 
         console2.log("");

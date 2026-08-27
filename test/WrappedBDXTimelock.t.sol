@@ -5,7 +5,9 @@ import { Test } from "forge-std/Test.sol";
 import { WrappedBDX } from "../src/WrappedBDX.sol";
 import { ERC1967Proxy } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import { TimelockController } from "@openzeppelin/contracts/governance/TimelockController.sol";
-import { UUPSUpgradeable } from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import {
+    UUPSUpgradeable
+} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 
 /// Trivial V2 to prove UUPS upgrades flow through the timelock (Phase G.2).
 contract WrappedBDXTimelockV2 is WrappedBDX {
@@ -23,13 +25,14 @@ contract WrappedBDXTimelockTest is Test {
     TimelockController internal timelock;
 
     address internal multisig = address(0x6115); // governance proposer (a Safe, in production)
+    address internal guardian = address(0xBEEF01);
     address internal alice = address(0xB0B);
     address internal committee = address(0xC0FFEE);
 
     uint256 internal constant COIN = 1e9;
     uint256 internal constant WINDOW_CAP = 1_000_000 * COIN;
     uint256 internal constant PER_TX_MAX = 100_000 * COIN;
-    uint256 internal constant BOND_LIMIT = 1_400_000 * COIN;
+    uint256 internal constant BOND_LIMIT = 2_400_000 * COIN;
     uint256 internal constant EPOCH_SECONDS = 1 days;
     uint256 internal constant ROTATE_TIMELOCK = 2 days;
     uint256 internal constant MIN_DELAY = 2 days;
@@ -44,7 +47,16 @@ contract WrappedBDXTimelockTest is Test {
         WrappedBDX impl = new WrappedBDX();
         bytes memory init = abi.encodeCall(
             WrappedBDX.initialize,
-            (address(timelock), committee, WINDOW_CAP, PER_TX_MAX, BOND_LIMIT, EPOCH_SECONDS, ROTATE_TIMELOCK)
+            (
+                address(timelock),
+                guardian,
+                committee,
+                WINDOW_CAP,
+                PER_TX_MAX,
+                BOND_LIMIT,
+                EPOCH_SECONDS,
+                ROTATE_TIMELOCK
+            )
         );
         w = WrappedBDX(address(new ERC1967Proxy(address(impl), init)));
         vm.warp(10 * EPOCH_SECONDS + 5);
@@ -70,7 +82,7 @@ contract WrappedBDXTimelockTest is Test {
         w.setCaps(1, 1);
 
         vm.prank(multisig);
-        vm.expectRevert(WrappedBDX.NotAdmin.selector);
+        vm.expectRevert(WrappedBDX.NotGuardianOrAdmin.selector);
         w.pause();
 
         vm.prank(alice);
@@ -81,9 +93,13 @@ contract WrappedBDXTimelockTest is Test {
     // ---- the timelock flow lands admin actions ---------------------------------------
     function test_Timelock_setCaps_afterDelay() public {
         // Raise the bond backing then the cap, both through the timelock.
-        _scheduleAndExecute(address(w), abi.encodeCall(WrappedBDX.setBondBackingCapLimit, (BOND_LIMIT * 2)));
-        _scheduleAndExecute(address(w), abi.encodeCall(WrappedBDX.setCaps, (BOND_LIMIT * 2, PER_TX_MAX)));
-        assertEq(w.windowMintCap(), BOND_LIMIT * 2);
+        uint256 newCap = BOND_LIMIT;
+        uint256 newBacking = 2 * newCap;
+        _scheduleAndExecute(
+            address(w), abi.encodeCall(WrappedBDX.setBondBackingCapLimit, (newBacking))
+        );
+        _scheduleAndExecute(address(w), abi.encodeCall(WrappedBDX.setCaps, (newCap, PER_TX_MAX)));
+        assertEq(w.windowMintCap(), newCap);
     }
 
     function test_Timelock_pause_afterDelay() public {
@@ -121,7 +137,9 @@ contract WrappedBDXTimelockTest is Test {
     function test_Timelock_nonProposerCannotSchedule() public {
         vm.prank(alice);
         vm.expectRevert(); // AccessControl: missing PROPOSER_ROLE
-        timelock.schedule(address(w), 0, abi.encodeCall(WrappedBDX.pause, ()), bytes32(0), bytes32(0), MIN_DELAY);
+        timelock.schedule(
+            address(w), 0, abi.encodeCall(WrappedBDX.pause, ()), bytes32(0), bytes32(0), MIN_DELAY
+        );
     }
 
     // ---- the bond-before-caps guard fires *inside* the timelocked call ---------------

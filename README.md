@@ -1,68 +1,95 @@
-# wBDX contract (Phase H)
+# wBDX bridge contract security fixes (Phase H)
 
-The EVM side of the Beldex Sovereign Bridge: a signer-gated, domain-separated,
-replay-guarded, fixed-window-capped upgradeable ERC-20 whose **mint authority is the
-`Pevm` masternode-committee key** (secp256k1 / CGGMP21), verified by `ecrecover`.
+This repository contains the EVM-side `WrappedBDX` contract and the security fixes made
+to align it with the Beldex bridge signer and relayer. It is a standalone Foundry project.
 
-This is a **standalone Foundry project** (moved out of the Beldex monorepo). The design
-lives in the Beldex repo at `bridge/docs/IMPLEMENTATION.md` §12 (Phase H); the off-chain
-signer it must agree with byte-for-byte is `bridge/signer/src/watch.rs` in that same repo.
-This README is the build/test entry point.
+> **Status:** this documents implemented and tested fixes. It is not a declaration that
+> the complete distributed bridge is production ready. Mainnet deployment still requires
+> the external review, custody, migration, persistence, and fault-testing work listed in
+> [BRIDGE_SECURITY_FIXES.md](BRIDGE_SECURITY_FIXES.md).
 
 ## Layout
 
-```
-src/WrappedBDX.sol        the contract (H.1–H.6)
-test/WrappedBDX.t.sol     full Foundry suite (the Phase H definition-of-done)
-script/Deploy.s.sol       UUPS proxy deploy (per-chain params via env / E.3 registry)
+```text
+src/WrappedBDX.sol                 upgradeable 9-decimal wBDX contract
+test/WrappedBDX.t.sol              contract security and regression tests
+test/WrappedBDXTimelock.t.sol      timelocked governance tests
+script/Deploy.s.sol                UUPS proxy deployment
+script/DeployWithTimelock.s.sol    proxy plus TimelockController deployment
+devnet/                            local deployment, mint, relay, and rotation scripts
 ```
 
-## Setup
+## Setup and verification
 
-Run from this project root. Foundry + OpenZeppelin are not vendored — they install into
-`lib/` (`forge-std` is already present). From the project directory:
+The repository is pinned to Solidity 0.8.24 and OpenZeppelin v5. Initialize the pinned
+submodules and run the checks from the repository root:
 
 ```bash
-forge install OpenZeppelin/openzeppelin-contracts-upgradeable --no-commit
-forge install OpenZeppelin/openzeppelin-contracts --no-commit   # non-upgradeable utils (ECDSA, ERC1967Proxy)
+git submodule update --init --recursive
 forge build
-forge test -vvv
+forge test -vv
+forge fmt --check
+bash -n devnet/*.sh
 ```
 
-Pinned to **OpenZeppelin v5** and **solc 0.8.24** (`foundry.toml`).
+The current Foundry regression suite contains 54 passing tests.
 
-## The one byte-level invariant that matters
+## Canonical Mint V2 invariant
 
-The mint digest is
-`keccak256(abi.encode(MINT_TAG, block.chainid, address(this), to, amount, beldexTxid))`
-and must match the Rust signer's `watch.rs::MintEvent::mint_preimage` **exactly**.
+The load-bearing mint digest is:
 
-`MINT_TAG = keccak256("BELDEX_BRIDGE_MINT_V1")`. The Rust signer hardcodes the same
-precomputed 32 bytes (`watch.rs::MINT_TAG`) and guards them with a keccak drift test;
-the contract computes `keccak256(...)` directly. `test_MintTag_isKeccakOfDomainString`
-pins the value (and cross-checks the signer's exact bytes), and every mint test signs the
-digest exactly as the signer would, so a drift in field order, chain-id binding, or tag
-value fails the suite.
+```solidity
+keccak256(
+    abi.encode(
+        MINT_TAG,
+        block.chainid,
+        address(this),
+        keyEpoch,
+        to,
+        amount,
+        beldexTxid,
+        outputIndex
+    )
+)
+```
 
-Likewise `redeemToNative` emits `RedeemToNative(address indexed from, uint256 amount,
-bytes beldexAddress)` — the exact event `evm_watcher.rs` decodes (`from` indexed;
-`abi.encode(amount, beldexAddress)` in the data).
+`MINT_TAG` is `keccak256("BELDEX_BRIDGE_MINT_V2")`. The Rust signer and relayer must
+encode the same eight ABI words in exactly this order. This binds a signature to:
 
-## Operational notes
+- one EVM chain and proxy;
+- one signer epoch;
+- one recipient and amount; and
+- one output of one Beldex transaction.
 
-- **`admin` must be a `TimelockController` + multisig**, never an EOA, never a committee
-  signer. It manages the signer set, pause, caps, and upgrades — it can stop the bleeding
-  and rotate signers, but it can never mint. `script/DeployWithTimelock.s.sol` wires this
-  production shape (governance multisig = timelock proposer, open executor, min delay), and
-  `test/WrappedBDXTimelock.t.sol` (Phase G.2) proves the flow: direct admin calls revert,
-  every admin action must be scheduled and wait out the delay, and the bond-before-caps
-  guard + UUPS upgrade both flow through the timelock.
-- **Rotation is self-authorizing** (H.6): the outgoing committee signs in the incoming
-  one (`rotateSigner`), a challenge window elapses, then anyone `activateRotation`s.
-  `vetoRotation` (a freeze trigger) blocks activation on a watcher-detected mismatch.
-  `breakGlassSetSigner` is the admin fallback only when no valid hand-off lands.
-- **Caps are per fixed calendar window** (`β=1`) and cannot be raised above
-  `bondBackingCapLimit` — encoding "raise the bond before the caps" on-chain.
-- **9 decimals** so 1 wBDX unit == 1 atomic BDX.
+Any field-order, tag, epoch, or output-index mismatch causes signature recovery to fail.
+The corresponding Rust implementation is `bridge/signer/src/watch.rs` in the Beldex
+repository.
 
-External audit required before mainnet (S13).
+## Implemented contract fixes
+
+- Per-output replay identity using `(beldexTxid, outputIndex)`, while preserving legacy
+  V1 transaction replay markers during an upgrade.
+- Fixed-window mint and per-transaction caps with backing for the worst-case two-window
+  boundary exposure.
+- Monotonic signer epochs, outgoing and incoming committee handoff proofs, a rotation
+  challenge period, persistent vetoes, and scoped recovery signers.
+- Separate timelocked administration and guardian duties, two-step admin transfer, and
+  guarded UUPS upgrades.
+- Full CryptoNote block-Base58 decoding for mainnet Beldex standard, subaddress, and
+  integrated-address formats, including prefix and checksum validation before burning.
+- Nine decimals so one wBDX atomic unit equals one BDX atomic unit.
+
+`redeemToNative` emits `RedeemToNative(address indexed from, uint256 amount,
+bytes beldexAddress)`, matching the event decoded by the EVM watcher.
+
+## Operational constraints
+
+- `admin` should be a delayed governance controller, not an EOA or committee signer.
+- `guardian`, `admin`, and the active threshold signer must be independent roles.
+- Fixed windows can expose almost two complete caps around a boundary; therefore
+  `2 * windowMintCap <= bondBackingCapLimit` is enforced.
+- Pause the bridge before any contract or signature-schema migration. Mixed Mint V1/V2
+  operation is unsupported.
+- The contract validates mainnet Beldex recipient formats. A Beldex devnet using devnet
+  address prefixes needs an explicit test-only compatibility plan.
+- An independent end-to-end security review remains required before mainnet deployment.

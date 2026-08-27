@@ -7,9 +7,9 @@ import { ERC1967Proxy } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy
 
 /// Deploys the WrappedBDX implementation behind an ERC1967 UUPS proxy.
 ///
-/// Per-chain values (caps, window, timelock) come from the E.3 chain registry; pass
-/// them via env. `ADMIN` MUST be a TimelockController (+ multisig), never an EOA, and
-/// never a committee signer. `INITIAL_SIGNER` is the genesis `Pevm` committee address.
+/// Per-chain values come from the E.3 registry. `ADMIN` must be a timelock and
+/// `GUARDIAN` a separate fast incident-response multisig. The backing limit is the
+/// allocation for this chain, not the bridge's global bond.
 ///
 ///   forge script script/Deploy.s.sol \
 ///     --rpc-url $RPC --broadcast \
@@ -17,6 +17,7 @@ import { ERC1967Proxy } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy
 contract Deploy is Script {
     function run() external {
         address admin = vm.envAddress("ADMIN");
+        address guardian = vm.envAddress("GUARDIAN");
         address initialSigner = vm.envAddress("INITIAL_SIGNER");
         uint256 windowMintCap = vm.envUint("WINDOW_MINT_CAP");
         uint256 perTxMax = vm.envUint("PER_TX_MAX");
@@ -24,12 +25,29 @@ contract Deploy is Script {
         uint256 epochSeconds = vm.envUint("EPOCH_SECONDS");
         uint256 rotateTimelock = vm.envUint("ROTATE_TIMELOCK");
 
+        require(admin.code.length > 0, "ADMIN must be a contract");
+        require(guardian != address(0) && guardian != initialSigner, "bad GUARDIAN");
+        require(admin != guardian, "admin=guardian");
+        require(admin != initialSigner, "admin=signer");
+        require(windowMintCap > 0 && perTxMax > 0 && perTxMax <= windowMintCap, "bad caps");
+        require(windowMintCap <= bondBackingCapLimit / 2, "backing must cover 2x window");
+        require(epochSeconds > 0 && rotateTimelock > 0, "zero delay/window");
+
         vm.startBroadcast();
 
         WrappedBDX impl = new WrappedBDX();
         bytes memory init = abi.encodeCall(
             WrappedBDX.initialize,
-            (admin, initialSigner, windowMintCap, perTxMax, bondBackingCapLimit, epochSeconds, rotateTimelock)
+            (
+                admin,
+                guardian,
+                initialSigner,
+                windowMintCap,
+                perTxMax,
+                bondBackingCapLimit,
+                epochSeconds,
+                rotateTimelock
+            )
         );
         ERC1967Proxy proxy = new ERC1967Proxy(address(impl), init);
 

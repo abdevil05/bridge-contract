@@ -50,7 +50,7 @@ echo "r||s: $SIG_RS"
 
 # ── 2. mint ──────────────────────────────────────────────────────────────────
 say "mint"
-PROXY="$PROXY" TO="$TO" AMOUNT="$AMOUNT" BELDEX_TXID="$BELDEX_TXID" SIG_RS="$SIG_RS" \
+PROXY="$PROXY" TO="$TO" AMOUNT="$AMOUNT" BELDEX_TXID="$BELDEX_TXID" OUT_INDEX="$OUT_INDEX" SIG_RS="$SIG_RS" \
   forge script script/DevnetMint.s.sol:DevnetMint \
     --rpc-url "$RPC" --private-key "$DEPLOYER_KEY" --broadcast -vv
 
@@ -59,16 +59,16 @@ say "verify"
 printf 'balanceOf(%s)\n  = %s\n' "$TO" "$(cast call "$PROXY" 'balanceOf(address)(uint256)' "$TO" --rpc-url "$RPC")"
 printf 'totalSupply       = %s\n' "$(cast call "$PROXY" 'totalSupply()(uint256)' --rpc-url "$RPC")"
 printf 'windowMinted      = %s\n' "$(cast call "$PROXY" 'windowMinted()(uint256)' --rpc-url "$RPC")"
-printf 'processedDeposits = %s\n' "$(cast call "$PROXY" 'processedDeposits(bytes32)(bool)' "$BELDEX_TXID" --rpc-url "$RPC")"
+printf 'deposit processed = %s\n' "$(cast call "$PROXY" 'isDepositProcessed(bytes32,uint32)(bool)' "$BELDEX_TXID" "$OUT_INDEX" --rpc-url "$RPC")"
 
 say "Minted event"
 cast logs --from-block 0 --address "$PROXY" \
-  "$(cast sig-event 'Minted(address,uint256,bytes32)')" --rpc-url "$RPC" || true
+  "$(cast sig-event 'Minted(address,uint256,bytes32,uint32)')" --rpc-url "$RPC" || true
 
 # ── 4. replay guard ──────────────────────────────────────────────────────────
 say "replay: resubmitting the same beldexTxid must revert"
-REPLAY_OUT="$(cast call "$PROXY" 'mint(address,uint256,bytes32,bytes)' \
-  "$TO" "$AMOUNT" "$BELDEX_TXID" "${SIG_RS}1c" --rpc-url "$RPC" 2>&1)" && REPLAY_RC=0 || REPLAY_RC=1
+REPLAY_OUT="$(cast call "$PROXY" 'mint(address,uint256,bytes32,uint32,bytes)' \
+  "$TO" "$AMOUNT" "$BELDEX_TXID" "$OUT_INDEX" "${SIG_RS}1c" --rpc-url "$RPC" 2>&1)" && REPLAY_RC=0 || REPLAY_RC=1
 if [ "$REPLAY_RC" -eq 0 ]; then
   echo "!! replay did NOT revert"; exit 1
 fi

@@ -14,18 +14,26 @@ import { TimelockController } from "@openzeppelin/contracts/governance/TimelockC
 /// with the bond-before-caps guard, UUPS upgrade) subject to a public, timelocked review
 /// window (S8/S11).
 ///
-///   MIN_DELAY, PROPOSER (governance multisig), INITIAL_SIGNER, WINDOW_MINT_CAP, PER_TX_MAX,
+///   MIN_DELAY, PROPOSER (governance multisig), GUARDIAN, INITIAL_SIGNER, WINDOW_MINT_CAP, PER_TX_MAX,
 ///   BOND_BACKING_CAP_LIMIT, EPOCH_SECONDS, ROTATE_TIMELOCK  (all via env)
 contract DeployWithTimelock is Script {
     function run() external {
         uint256 minDelay = vm.envUint("MIN_DELAY");
         address proposer = vm.envAddress("PROPOSER"); // governance multisig
+        address guardian = vm.envAddress("GUARDIAN"); // fast pause/veto multisig
         address initialSigner = vm.envAddress("INITIAL_SIGNER");
         uint256 windowMintCap = vm.envUint("WINDOW_MINT_CAP");
         uint256 perTxMax = vm.envUint("PER_TX_MAX");
         uint256 bondBackingCapLimit = vm.envUint("BOND_BACKING_CAP_LIMIT");
         uint256 epochSeconds = vm.envUint("EPOCH_SECONDS");
         uint256 rotateTimelock = vm.envUint("ROTATE_TIMELOCK");
+
+        require(minDelay > 0 && rotateTimelock > 0 && epochSeconds > 0, "zero delay/window");
+        require(proposer != address(0) && guardian != address(0), "zero governance");
+        require(proposer != initialSigner && guardian != initialSigner, "governance=signer");
+        require(proposer != guardian, "proposer=guardian");
+        require(windowMintCap > 0 && perTxMax > 0 && perTxMax <= windowMintCap, "bad caps");
+        require(windowMintCap <= bondBackingCapLimit / 2, "backing must cover 2x window");
 
         vm.startBroadcast();
 
@@ -35,14 +43,19 @@ contract DeployWithTimelock is Script {
         proposers[0] = proposer;
         address[] memory executors = new address[](1);
         executors[0] = address(0); // open executor: anyone may execute after the delay
-        TimelockController timelock =
-            new TimelockController(minDelay, proposers, executors, address(0) /* self-administered */);
+        TimelockController timelock = new TimelockController(
+            minDelay,
+            proposers,
+            executors,
+            address(0) /* self-administered */
+        );
 
         WrappedBDX impl = new WrappedBDX();
         bytes memory init = abi.encodeCall(
             WrappedBDX.initialize,
             (
                 address(timelock), // admin = the timelock
+                guardian,
                 initialSigner,
                 windowMintCap,
                 perTxMax,

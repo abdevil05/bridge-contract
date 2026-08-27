@@ -12,7 +12,7 @@
 #   3. rotateSigner is accepted, and currentSigner does NOT move yet
 #   4. activateRotation reverts RotationNotReady before the window closes
 #   5. after warping past it, activateRotation switches the key and emits Rotated
-#   6. re-proposing the same epoch now reverts StaleEpoch (anti-rollback)
+#   6. re-proposing the same epoch now reverts InvalidEpoch (anti-rollback)
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -79,7 +79,32 @@ if [ -n "$LOGGED" ]; then
   echo "digest cross-check : the committee signed exactly ${ROTATE_DIGEST}"
 fi
 
+# The incoming committee's signature is a separate proof of possession. The signer
+# wrapper must log ACTIVATE=1 runs under activate-sign-* so the two keys cannot mix.
+ASIGS="$(grep -h '^Pevm signature:' "$TESTDATA"/activate-sign-*.log 2>/dev/null \
+         | sed 's/^Pevm signature:[[:space:]]*//' | tr -d ' \r' | sort -u || true)"
+ANSIG="$(printf '%s\n' "$ASIGS" | grep -c . || true)"
+if [ "$ANSIG" -eq 0 ]; then
+  echo "!! no activation signature in $TESTDATA/activate-sign-*.log" >&2
+  echo "   SHARE_SUBDIR=shares-next ACTIVATE=1 runlog ./sign-rotate.sh $ACTIVATE_PREIMAGE" >&2
+  exit 1
+fi
+if [ "$ANSIG" -ne 1 ]; then
+  echo "!! incoming signers produced $ANSIG distinct activation signatures" >&2
+  exit 1
+fi
+ARS="$(printf '%s' "$ASIGS")"
+case "$ARS" in 0x*) ;; *) ARS="0x$ARS" ;; esac
+[ "${#ARS}" -eq 130 ] || { echo "!! activation signature must be 64-byte r||s" >&2; exit 1; }
+ALOGGED="$(grep -h 'over digest' "$TESTDATA"/activate-sign-*.log 2>/dev/null \
+           | sed 's/.*over digest[[:space:]]*:*[[:space:]]*//' | tr -d ' \r' | sort -u | head -1 || true)"
+if [ -n "$ALOGGED" ] && [ "$(lower "${ALOGGED#0x}")" != "$(lower "${ACTIVATE_DIGEST#0x}")" ]; then
+  echo "!! incoming committee signed $ALOGGED, expected $ACTIVATE_DIGEST" >&2
+  exit 1
+fi
+
 echo "signature          : $RS"
+echo "activation sig     : $ARS"
 echo "outgoing signer    : $OUTGOING_SIGNER  (keyEpoch $CUR_KEY_EPOCH)"
 echo "incoming signer    : $NEW_SIGNER  (keyEpoch $NEW_KEY_EPOCH)"
 echo ""
@@ -106,7 +131,7 @@ echo "-> proposed; currentSigner still $OUTGOING_SIGNER, activates at $ACTIVATE_
 # =======================================================================================
 echo ""
 echo "── early activation must fail ─────────────────────────────────────────"
-EARLY="$(cast call "$PROXY" 'activateRotation()' --rpc-url "$RPC" 2>&1 || true)"
+EARLY="$(cast call "$PROXY" 'activateRotation(bytes)' 0x --rpc-url "$RPC" 2>&1 || true)"
 case "$EARLY" in
   *RotationNotReady*|*0f1f7e1a*)
     echo "-> RotationNotReady()  the challenge window is being enforced" ;;
@@ -152,7 +177,7 @@ fi
 # DKG'd. Catch it here with a clear message rather than letting forge report a bare revert.
 echo ""
 echo "── activate ───────────────────────────────────────────────────────────"
-PRECHECK="$(cast call "$PROXY" 'activateRotation()' --rpc-url "$RPC" 2>&1 || true)"
+PRECHECK="$(cast call "$PROXY" 'activateRotation(bytes)' "$ARS" --rpc-url "$RPC" 2>&1 || true)"
 case "$PRECHECK" in
   *RotationIsVetoed*|*475abcc2*)
     echo "!! RotationIsVetoed() — this rotation was vetoed during the challenge window." >&2
@@ -163,9 +188,12 @@ case "$PRECHECK" in
   *RotationNotReady*|*0f1f7e1a*)
     echo "!! still RotationNotReady after the warp — chain time did not advance enough" >&2
     exit 1 ;;
+  *IncomingNotReady*)
+    echo "!! the activation signature does not recover to pendingSigner" >&2
+    exit 1 ;;
 esac
 
-PROXY="$PROXY" \
+PROXY="$PROXY" ACTIVATE_RS="$ARS" \
   forge script script/DevnetRotate.s.sol:DevnetRotate --sig 'activate()' \
     --rpc-url "$RPC" --private-key "$DEPLOYER_KEY" --broadcast -vv
 
@@ -204,7 +232,7 @@ echo "── replay the rotation (must be rejected) ─────────�
 STALE="$(cast call "$PROXY" 'rotateSigner(address,uint64,bytes)' \
           "$NEW_SIGNER" "$NEW_KEY_EPOCH" "${RS}1b" --rpc-url "$RPC" 2>&1 || true)"
 case "$STALE" in
-  *StaleEpoch*|*68549ea1*) echo "-> StaleEpoch()  anti-rollback holds" ;;
+  *InvalidEpoch*)          echo "-> InvalidEpoch()  anti-rollback holds" ;;
   *BadSigner*|*61330e93*)  echo "-> BadSigner()   (rejected, though on the signature not the epoch —" ;
                            echo "                 expected, since this probe appends a guessed v)" ;;
   *) echo "-> rejected for an unrecognised reason:" ; echo "$STALE" ;;
@@ -224,7 +252,7 @@ if [ "$FAIL" -eq 0 ]; then
 
     # the OLD committee can no longer mint (expect BadSigner)
     # the NEW committee can (expect a successful mint)
-    # -> re-run 01/02 with a fresh BELDEX_TXID against the new share dir
+    # -> use 05/06 with a fresh (BELDEX_TXID, OUT_INDEX) against the new share dir
 
 EOF
 else

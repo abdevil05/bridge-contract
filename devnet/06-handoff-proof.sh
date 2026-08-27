@@ -157,8 +157,8 @@ printf 'balanceOf(%s) = %s\ntotalSupply = %s\ncurrentSigner = %s (keyEpoch %s)\n
 # failed for every v it could have been.
 say "leg A — retired committee ($RETIRED_SIGNER) attempts the mint"
 for V in 1b 1c; do
-  OUT="$(cast call "$PROXY" 'mint(address,uint256,bytes32,bytes)' \
-          "$TO" "$AMOUNT" "$BELDEX_TXID" "0x${RS_OLD}${V}" --rpc-url "$RPC" 2>&1)" && RC=0 || RC=1
+  OUT="$(cast call "$PROXY" 'mint(address,uint256,bytes32,uint32,bytes)' \
+          "$TO" "$AMOUNT" "$BELDEX_TXID" "$OUT_INDEX" "0x${RS_OLD}${V}" --rpc-url "$RPC" 2>&1)" && RC=0 || RC=1
   if [ "$RC" -eq 0 ]; then
     fail "the retired committee's signature was ACCEPTED with v=0x$V.
    The rotation did not actually retire it. Do not ship this."
@@ -188,7 +188,7 @@ echo "  That is the hand-off biting, not a broken signature."
 
 # --- leg B: the promoted committee MUST be able to mint ----------------------------------------
 say "leg B — promoted committee ($LIVE_SIGNER) mints"
-PROXY="$PROXY" TO="$TO" AMOUNT="$AMOUNT" BELDEX_TXID="$BELDEX_TXID" SIG_RS="0x$SIG_NEW" \
+PROXY="$PROXY" TO="$TO" AMOUNT="$AMOUNT" BELDEX_TXID="$BELDEX_TXID" OUT_INDEX="$OUT_INDEX" SIG_RS="0x$SIG_NEW" \
   forge script script/DevnetMint.s.sol:DevnetMint \
     --rpc-url "$RPC" --private-key "$DEPLOYER_KEY" --broadcast -vv
 
@@ -196,14 +196,14 @@ PROXY="$PROXY" TO="$TO" AMOUNT="$AMOUNT" BELDEX_TXID="$BELDEX_TXID" SIG_RS="0x$S
 say "verify"
 BAL_AFTER="$(num "$(cast call "$PROXY" 'balanceOf(address)(uint256)' "$TO" --rpc-url "$RPC")")"
 SUPPLY_AFTER="$(num "$(cast call "$PROXY" 'totalSupply()(uint256)' --rpc-url "$RPC")")"
-SPENT="$(cast call "$PROXY" 'processedDeposits(bytes32)(bool)' "$BELDEX_TXID" --rpc-url "$RPC")"
+SPENT="$(cast call "$PROXY" 'isDepositProcessed(bytes32,uint32)(bool)' "$BELDEX_TXID" "$OUT_INDEX" --rpc-url "$RPC")"
 CUR_AFTER="$(lc "$(cast call "$PROXY" 'currentSigner()(address)' --rpc-url "$RPC")")"
 EPOCH_AFTER="$(num "$(cast call "$PROXY" 'keyEpoch()(uint64)' --rpc-url "$RPC")")"
 
 printf 'balance  %s -> %s   (delta %s, expected %s)\n' \
   "$BAL_BEFORE" "$BAL_AFTER" "$(( BAL_AFTER - BAL_BEFORE ))" "$AMOUNT"
 printf 'supply   %s -> %s\n' "$SUPPLY_BEFORE" "$SUPPLY_AFTER"
-printf 'processedDeposits[%s] = %s\n' "$BELDEX_TXID" "$SPENT"
+printf 'deposit (%s, %s) processed = %s\n' "$BELDEX_TXID" "$OUT_INDEX" "$SPENT"
 printf 'currentSigner %s (keyEpoch %s)\n' "$CUR_AFTER" "$EPOCH_AFTER"
 
 [ "$(( BAL_AFTER - BAL_BEFORE ))" -eq "$AMOUNT" ] || fail "balance did not move by exactly AMOUNT"
@@ -216,7 +216,7 @@ echo "balance, supply, replay flag ✓ — and the mint moved neither currentSig
 
 say "Minted event for this txid"
 MINTED_LOGS="$(cast logs --from-block 0 --address "$PROXY" \
-  "$(cast sig-event 'Minted(address,uint256,bytes32)')" --rpc-url "$RPC" 2>/dev/null || true)"
+  "$(cast sig-event 'Minted(address,uint256,bytes32,uint32)')" --rpc-url "$RPC" 2>/dev/null || true)"
 if printf '%s\n' "$MINTED_LOGS" | grep -qi "${BELDEX_TXID#0x}"; then
   printf '%s\n' "$MINTED_LOGS" | grep -i -B6 -A6 "${BELDEX_TXID#0x}"
   echo "  a Minted log carries this beldexTxid as an indexed topic ✓"
@@ -234,8 +234,8 @@ say "leg C — the promoted committee's own signature, replayed"
 # coin flip: half the time it reports BadSigner and the replay guard is never exercised.
 REPLAY_OK=0
 for V in 1b 1c; do
-  OUT="$(cast call "$PROXY" 'mint(address,uint256,bytes32,bytes)' \
-          "$TO" "$AMOUNT" "$BELDEX_TXID" "0x${RS_NEW}${V}" --rpc-url "$RPC" 2>&1)" && RC=0 || RC=1
+  OUT="$(cast call "$PROXY" 'mint(address,uint256,bytes32,uint32,bytes)' \
+          "$TO" "$AMOUNT" "$BELDEX_TXID" "$OUT_INDEX" "0x${RS_NEW}${V}" --rpc-url "$RPC" 2>&1)" && RC=0 || RC=1
   if [ "$RC" -eq 0 ]; then
     fail "the replay did NOT revert with v=0x$V -- the same beldexTxid minted twice."
   fi
@@ -270,6 +270,7 @@ cat <<EOF
   contract     : $PROXY  (chain id $CHAIN_ID, keyEpoch $EPOCH_AFTER)
   one digest   : $DIGEST
   beldex txid  : $BELDEX_TXID
+  output index : $OUT_INDEX
 
   retired  $RETIRED_SIGNER
       signature valid over the digest, rejected by the contract: BadSigner() for BOTH v

@@ -15,10 +15,9 @@
 # WHAT IT REFUSES, AND WHY EACH REFUSAL MATTERS
 #   * currentSigner() still equal to mint.env's SIGNER_ADDR -> the rotation was never
 #     activated; there are not two committees yet to tell apart.
-#   * isSigner[retired] == true -> the retired key is on the contract's *additional*
-#     signer allowlist, so mint() would accept it on the second half of
-#     `recovered != currentSigner && !isSigner[recovered]`. BadSigner would never fire and
-#     the negative leg of the proof would be vacuous. This is the one precondition whose
+#   * isAuthorizedSigner(retired) == true -> the retired key is still effective for the
+#     current key epoch. BadSigner would never fire and the negative leg of the proof is
+#     vacuous. This is the one precondition whose
 #     absence would make a passing run meaningless rather than merely inconclusive.
 #   * a txid already in processedDeposits -> Replay() is checked AFTER BadSigner, so a
 #     spent txid would not actually corrupt the negative leg, but it would make the
@@ -46,6 +45,8 @@ OUT="${OUT:-devnet/mint2.env}"
 num() { printf '%s' "$1" | sed -n 's/^\([0-9][0-9]*\).*/\1/p'; }
 
 TXID="${1:-${NEW_BELDEX_TXID:-}}"
+FIRST_OUT_INDEX="${OUT_INDEX:-0}"
+OUTPUT_INDEX="${NEW_OUT_INDEX:-0}"
 if [ -z "$TXID" ]; then
   echo "usage: $0 0x<fresh-32-byte-beldex-txid>" >&2
   echo "" >&2
@@ -64,10 +65,14 @@ fi
 case "${TXID#0x}" in
   *[!0-9a-f]*) echo "!! the beldex txid contains non-hex characters" >&2; exit 1 ;;
 esac
-if [ "$TXID" = "$(lc "$BELDEX_TXID")" ]; then
-  echo "!! that is the txid the FIRST mint already used." >&2
-  echo "   mint() checks the replay guard after the signature, so this would revert" >&2
-  echo "   Replay() on the positive leg no matter which committee signed it." >&2
+case "$OUTPUT_INDEX" in
+  ''|*[!0-9]*) echo "!! NEW_OUT_INDEX must be an unsigned decimal integer" >&2; exit 1 ;;
+esac
+if [ "$OUTPUT_INDEX" -gt 4294967295 ]; then
+  echo "!! NEW_OUT_INDEX exceeds uint32" >&2; exit 1
+fi
+if [ "$TXID" = "$(lc "$BELDEX_TXID")" ] && [ "$OUTPUT_INDEX" = "$FIRST_OUT_INDEX" ]; then
+  echo "!! that exact (txid, outputIndex) pair was used by the first mint." >&2
   exit 1
 fi
 
@@ -117,23 +122,18 @@ if [ -n "${ROT_NEW:-}" ] && [ "$(lc "$ROT_NEW")" != "$LIVE_SIGNER" ]; then
 fi
 [ -n "${ROT_NEW:-}" ] && echo "chain agrees with rotate.env on the incoming signer ✓"
 
-# The allowlist check. Without it a green run proves nothing: mint() accepts
-#   recovered == currentSigner  ||  isSigner[recovered]
-# so a retired key left on the allowlist still mints, and "BadSigner" would only ever
-# have meant "and it was not on the allowlist either".
-ALLOWLISTED="$(cast call "$PROXY" 'isSigner(address)(bool)' "$RETIRED_SIGNER" --rpc-url "$RPC")"
-if [ "$(lc "$ALLOWLISTED")" != "false" ]; then
-  echo "!! isSigner[$RETIRED_SIGNER] = $ALLOWLISTED" >&2
-  echo "   The retired committee is still on the additional-signer allowlist, so mint()" >&2
+AUTHORIZED="$(cast call "$PROXY" 'isAuthorizedSigner(address)(bool)' "$RETIRED_SIGNER" --rpc-url "$RPC")"
+if [ "$(lc "$AUTHORIZED")" != "false" ]; then
+  echo "!! isAuthorizedSigner[$RETIRED_SIGNER] = $AUTHORIZED" >&2
+  echo "   The retired committee is still effective in the current key epoch, so mint()" >&2
   echo "   would accept it and the negative half of this proof would be vacuous." >&2
-  echo "   Remove it first:  cast send \$PROXY 'removeSigner(address)' $RETIRED_SIGNER ..." >&2
   exit 1
 fi
-echo "isSigner[retired] = false ✓  (so BadSigner, if it fires, is about the rotation)"
+echo "isAuthorizedSigner(retired) = false ✓"
 
-SPENT="$(cast call "$PROXY" 'processedDeposits(bytes32)(bool)' "$TXID" --rpc-url "$RPC")"
+SPENT="$(cast call "$PROXY" 'isDepositProcessed(bytes32,uint32)(bool)' "$TXID" "$OUTPUT_INDEX" --rpc-url "$RPC")"
 if [ "$(lc "$SPENT")" != "false" ]; then
-  echo "!! processedDeposits[$TXID] is already true — pick another txid." >&2
+  echo "!! deposit ($TXID, $OUTPUT_INDEX) is already processed." >&2
   exit 1
 fi
 echo "the txid is unspent ✓"
@@ -160,8 +160,9 @@ fi
 
 # --- the preimage ------------------------------------------------------------------------
 # Byte-for-byte what WrappedBDX.mint() keccaks:
-#   abi.encode(MINT_TAG, block.chainid, address(this), to, amount, beldexTxid)
-# Six static words = 192 bytes. Built from the tag read off THIS proxy, not from mint.env,
+#   abi.encode(MINT_TAG, block.chainid, address(this), keyEpoch,
+#              to, amount, beldexTxid, outputIndex)
+# Eight static words = 256 bytes. Built from the tag read off THIS proxy, not from mint.env,
 # so a redeployment between then and now cannot go unnoticed.
 say "mint preimage"
 if [ "$(lc "$MINT_TAG_ONCHAIN")" != "$(lc "$MINT_TAG")" ]; then
@@ -170,12 +171,12 @@ if [ "$(lc "$MINT_TAG_ONCHAIN")" != "$(lc "$MINT_TAG")" ]; then
   exit 1
 fi
 PREIMAGE2="$(cast abi-encode \
-  'f(bytes32,uint256,address,address,uint256,bytes32)' \
-  "$MINT_TAG_ONCHAIN" "$CHAIN_ID" "$PROXY" "$TO" "$AMOUNT" "$TXID")"
+  'f(bytes32,uint256,address,uint64,address,uint256,bytes32,uint32)' \
+  "$MINT_TAG_ONCHAIN" "$CHAIN_ID" "$PROXY" "$KEY_EPOCH" "$TO" "$AMOUNT" "$TXID" "$OUTPUT_INDEX")"
 DIGEST2="$(cast keccak "$PREIMAGE2")"
 HEXLEN="$(printf '%s' "${PREIMAGE2#0x}" | wc -c | tr -d ' ')"
-if [ "$HEXLEN" -ne 384 ]; then
-  echo "!! expected 384 hex chars (192 bytes / 6 ABI words) — got $HEXLEN." >&2
+if [ "$HEXLEN" -ne 512 ]; then
+  echo "!! expected 512 hex chars (256 bytes / 8 ABI words) — got $HEXLEN." >&2
   exit 1
 fi
 
@@ -189,6 +190,7 @@ DEPLOYER_KEY=$DEPLOYER_KEY
 TO=$TO
 AMOUNT=$AMOUNT
 BELDEX_TXID=$TXID
+OUT_INDEX=$OUTPUT_INDEX
 MINT_TAG=$MINT_TAG_ONCHAIN
 LIVE_SIGNER=$LIVE_SIGNER
 RETIRED_SIGNER=$RETIRED_SIGNER

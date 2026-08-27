@@ -24,48 +24,15 @@ contract DevnetMint is Script {
         address proxy = vm.envAddress("PROXY");
         address to = vm.envAddress("TO");
         uint256 amount = vm.envUint("AMOUNT");
+        uint32 outputIndex = uint32(vm.envOr("OUT_INDEX", uint256(0)));
         bytes32 beldexTxid = vm.envBytes32("BELDEX_TXID");
         bytes memory rs = vm.envBytes("SIG_RS");
-        require(rs.length == 64, "SIG_RS must be exactly 64 bytes (r||s)");
-
-        bytes32 r;
-        bytes32 s;
-        assembly {
-            r := mload(add(rs, 32))
-            s := mload(add(rs, 64))
-        }
-        if (uint256(s) > N / 2) {
-            s = bytes32(N - uint256(s));
-            console2.log("low-S normalised (signer emitted the high-S form)");
-        }
-
         WrappedBDX w = WrappedBDX(proxy);
-        address signer = w.currentSigner();
-
-        // Recompute the digest the way mint() does, from live chain state.
-        bytes32 digest =
-            keccak256(abi.encode(w.MINT_TAG(), block.chainid, proxy, to, amount, beldexTxid));
-        console2.log("digest       :", vm.toString(digest));
-        console2.log("currentSigner:", signer);
-
-        uint8 v;
-        for (uint8 cand = 27; cand <= 28; ++cand) {
-            if (ecrecover(digest, cand, r, s) == signer) {
-                v = cand;
-                break;
-            }
-        }
-        require(
-            v != 0,
-            "neither v=27 nor v=28 recovers currentSigner - the committee signed a different preimage"
-        );
-        console2.log("recovery id v:", uint256(v));
-
-        bytes memory sig = abi.encodePacked(r, s, v);
+        bytes memory sig = _mintSignature(w, proxy, to, amount, beldexTxid, outputIndex, rs);
         uint256 balBefore = w.balanceOf(to);
 
         vm.startBroadcast();
-        w.mint(to, amount, beldexTxid, sig);
+        w.mint(to, amount, beldexTxid, outputIndex, sig);
         vm.stopBroadcast();
 
         console2.log("balance before:", balBefore);
@@ -73,7 +40,49 @@ contract DevnetMint is Script {
         console2.log("totalSupply   :", w.totalSupply());
         console2.log("windowMinted  :", w.windowMinted());
         require(w.balanceOf(to) == balBefore + amount, "balance did not increase by amount");
-        require(w.processedDeposits(beldexTxid), "deposit not marked processed");
-        console2.log("MINT OK - replay guard armed for this beldexTxid");
+        require(
+            w.isDepositProcessed(beldexTxid, outputIndex), "deposit output not marked processed"
+        );
+        console2.log("MINT OK - replay guard armed for this deposit output");
+    }
+
+    function _mintSignature(
+        WrappedBDX w,
+        address proxy,
+        address to,
+        uint256 amount,
+        bytes32 beldexTxid,
+        uint32 outputIndex,
+        bytes memory rs
+    ) internal view returns (bytes memory) {
+        require(rs.length == 64, "SIG_RS must be exactly 64 bytes (r||s)");
+        bytes32 r;
+        bytes32 s;
+        assembly {
+            r := mload(add(rs, 32))
+            s := mload(add(rs, 64))
+        }
+        if (uint256(s) > N / 2) s = bytes32(N - uint256(s));
+
+        bytes32 digest = keccak256(
+            abi.encode(
+                w.MINT_TAG(),
+                block.chainid,
+                proxy,
+                w.keyEpoch(),
+                to,
+                amount,
+                beldexTxid,
+                outputIndex
+            )
+        );
+        address signer = w.currentSigner();
+        console2.log("digest       :", vm.toString(digest));
+        console2.log("currentSigner:", signer);
+
+        for (uint8 v = 27; v <= 28; ++v) {
+            if (ecrecover(digest, v, r, s) == signer) return abi.encodePacked(r, s, v);
+        }
+        revert("neither recovery id matches currentSigner");
     }
 }

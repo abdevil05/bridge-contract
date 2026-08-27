@@ -165,7 +165,8 @@ echo "  r||s||v : ${RS}${V_HEX}   ($V_PROV)"
 say "3 — digest differential: relayer vs cast"
 
 DIGOUT="$("$RELAYER" mint-digest \
-  --chain-id "$CHAIN_ID" --contract "$PROXY" --to "$TO" --amount "$AMOUNT" --txid "$BELDEX_TXID")" \
+  --chain-id "$CHAIN_ID" --contract "$PROXY" --key-epoch "$KEY_EPOCH" \
+  --to "$TO" --amount "$AMOUNT" --txid "$BELDEX_TXID" --output-index "$OUT_INDEX")" \
   || fail "relayer mint-digest failed"
 R_PRE="$(printf '%s' "$DIGOUT" | sed -n 's/^preimage: *\([0-9a-fA-F]*\).*/\1/p' | tr 'A-Z' 'a-z')"
 R_DIG="$(printf '%s' "$DIGOUT" | sed -n 's/^digest: *\([0-9a-fA-F]*\).*/\1/p' | tr 'A-Z' 'a-z')"
@@ -174,15 +175,15 @@ $DIGOUT"
 
 # $PREIMAGE and $DIGEST came from `cast abi-encode` + `cast keccak` in 05-mint-prep.sh.
 # The relayer computes both from its own hand-rolled word packing and its own keccak crate.
-[ "0x$R_PRE" = "$(lc "$PREIMAGE")" ] || fail "PREIMAGE MISMATCH — the relayer and cast disagree on the 192-byte preimage
+[ "0x$R_PRE" = "$(lc "$PREIMAGE")" ] || fail "PREIMAGE MISMATCH — the relayer and cast disagree on the 256-byte preimage
    relayer: 0x$R_PRE
    cast   : $(lc "$PREIMAGE")
-   One of the six words is packed differently. The committee would be signing a message
+   One of the eight words is packed differently. The committee would be signing a message
    the contract never recomputes."
 [ "0x$R_DIG" = "$(lc "$DIGEST")" ] || fail "DIGEST MISMATCH — same preimage, different keccak:
    relayer: 0x$R_DIG
    cast   : $(lc "$DIGEST")"
-echo "  preimage 192 bytes, byte-identical to cast abi-encode ✓"
+echo "  preimage 256 bytes, byte-identical to cast abi-encode ✓"
 echo "  digest   byte-identical to cast keccak ✓"
 echo "  (that is four independent implementations of this preimage now agreeing:"
 echo "   the relayer, the signer's watch.rs, cast, and the contract itself)"
@@ -191,18 +192,20 @@ echo "   the relayer, the signer's watch.rs, cast, and the contract itself)"
 say "4 — prepare: payload -> {chain_id, to, data}"
 
 PROXY_LC="$(lc "$PROXY")"
-mkpayload() {  # to amount txid sig
+mkpayload() {  # to amount txid output-index sig
   cat <<EOF
 { "kind": "mint",
   "contract": "$PROXY_LC",
   "chain_id": $CHAIN_ID,
+  "key_epoch": $KEY_EPOCH,
   "to": "$1",
   "amount": "$2",
   "beldex_txid": "$3",
-  "sig": "$4" }
+  "output_index": $4,
+  "sig": "$5" }
 EOF
 }
-mkpayload "$(lc "$TO")" "$AMOUNT" "$(lc "$BELDEX_TXID")" "$SIG65" > "$WORK/payload.json"
+mkpayload "$(lc "$TO")" "$AMOUNT" "$(lc "$BELDEX_TXID")" "$OUT_INDEX" "$SIG65" > "$WORK/payload.json"
 
 PREP="$("$RELAYER" prepare "$WORK/payload.json")" || fail "relayer prepare failed on $WORK/payload.json"
 P_CHAIN="$(printf '%s' "$PREP" | sed -n 's/^chain_id: *//p' | tr -d ' \r')"
@@ -219,8 +222,8 @@ echo "  payload  $WORK/payload.json"
 # ============================================================================= §5 calldata
 say "5 — calldata differential: relayer vs cast"
 
-CAST_DATA="$(lc "$(cast calldata 'mint(address,uint256,bytes32,bytes)' \
-                    "$TO" "$AMOUNT" "$BELDEX_TXID" "$SIG65")")"
+CAST_DATA="$(lc "$(cast calldata 'mint(address,uint256,bytes32,uint32,bytes)' \
+                    "$TO" "$AMOUNT" "$BELDEX_TXID" "$OUT_INDEX" "$SIG65")")"
 if [ "$DATA" != "$CAST_DATA" ]; then
   printf '%s\n' "$DATA"      | fold -w 64 | head -8 >&2
   echo "   --- vs ---" >&2
@@ -230,7 +233,7 @@ if [ "$DATA" != "$CAST_DATA" ]; then
    and the right-padding of a 65-byte value to 96. Do not broadcast this."
 fi
 echo "  ${#DATA} hex chars, byte-identical to cast calldata ✓"
-echo "  selector 0x${DATA:2:8} = mint(address,uint256,bytes32,bytes) ✓"
+echo "  selector 0x${DATA:2:8} = mint(address,uint256,bytes32,uint32,bytes) ✓"
 
 # ============================================================================== §6 tampers
 say "6 — a relayer can forge nothing"
@@ -251,9 +254,9 @@ assert len(b) == 65, len(b)
 b[63] ^= 0x01           # last byte of s: always recovers cleanly to a DIFFERENT address
 print("0x" + b.hex())' "$1"; }
 
-tamper() {  # label to amount txid sig
+tamper() {  # label to amount txid output-index sig
   local label="$1" data out rc
-  mkpayload "$2" "$3" "$4" "$5" > "$WORK/tampered.json"
+  mkpayload "$2" "$3" "$4" "$5" "$6" > "$WORK/tampered.json"
   data="$("$RELAYER" prepare "$WORK/tampered.json" | sed -n 's/^data: *//p' | tr -d ' \r' | tr 'A-Z' 'a-z')" \
     || fail "prepare failed on the $label tamper"
   [ -n "$data" ] || fail "prepare produced no calldata for the $label tamper"
@@ -280,15 +283,16 @@ tamper() {  # label to amount txid sig
   esac
 }
 
-tamper "recipient (to)"   "$(flip_last "$TO")" "$AMOUNT" "$(lc "$BELDEX_TXID")" "$SIG65"
-tamper "amount"           "$(lc "$TO")" "$(( AMOUNT + 1 ))" "$(lc "$BELDEX_TXID")" "$SIG65"
-tamper "beldex txid"      "$(lc "$TO")" "$AMOUNT" "$(flip_last "$BELDEX_TXID")" "$SIG65"
-tamper "signature"        "$(lc "$TO")" "$AMOUNT" "$(lc "$BELDEX_TXID")" "$(flip_s_tail "$SIG65")"
+tamper "recipient (to)"   "$(flip_last "$TO")" "$AMOUNT" "$(lc "$BELDEX_TXID")" "$OUT_INDEX" "$SIG65"
+tamper "amount"           "$(lc "$TO")" "$(( AMOUNT + 1 ))" "$(lc "$BELDEX_TXID")" "$OUT_INDEX" "$SIG65"
+tamper "beldex txid"      "$(lc "$TO")" "$AMOUNT" "$(flip_last "$BELDEX_TXID")" "$OUT_INDEX" "$SIG65"
+tamper "output index"     "$(lc "$TO")" "$AMOUNT" "$(lc "$BELDEX_TXID")" "$(( OUT_INDEX + 1 ))" "$SIG65"
+tamper "signature"        "$(lc "$TO")" "$AMOUNT" "$(lc "$BELDEX_TXID")" "$OUT_INDEX" "$(flip_s_tail "$SIG65")"
 
 # The routing fields are not signed and not part of the calldata — the relayer can only
 # misdeliver, never forge. Assert that misdelivery is at least visible in `prepare`'s output.
 ALT="$(flip_last "$PROXY")"
-mkpayload_alt="$(mkpayload "$(lc "$TO")" "$AMOUNT" "$(lc "$BELDEX_TXID")" "$SIG65" \
+mkpayload_alt="$(mkpayload "$(lc "$TO")" "$AMOUNT" "$(lc "$BELDEX_TXID")" "$OUT_INDEX" "$SIG65" \
                  | sed "s|\"contract\": \"$PROXY_LC\"|\"contract\": \"$(lc "$ALT")\"|")"
 printf '%s\n' "$mkpayload_alt" > "$WORK/misrouted.json"
 MIS_TO="$("$RELAYER" prepare "$WORK/misrouted.json" | sed -n 's/^to: *//p' | tr -d ' \r' | tr 'A-Z' 'a-z')"
@@ -352,7 +356,7 @@ echo "  from  : $TX_FROM   (the keyless broadcaster ✓)"
 
 BAL_AFTER="$(num "$(cast call "$PROXY" 'balanceOf(address)(uint256)' "$TO" --rpc-url "$RPC")")"
 SUP_AFTER="$(num "$(cast call "$PROXY" 'totalSupply()(uint256)' --rpc-url "$RPC")")"
-SPENT="$(lc "$(cast call "$PROXY" 'processedDeposits(bytes32)(bool)' "$BELDEX_TXID" --rpc-url "$RPC")")"
+SPENT="$(lc "$(cast call "$PROXY" 'isDepositProcessed(bytes32,uint32)(bool)' "$BELDEX_TXID" "$OUT_INDEX" --rpc-url "$RPC")")"
 SIGNER_AFTER="$(lc "$(cast call "$PROXY" 'currentSigner()(address)' --rpc-url "$RPC")")"
 
 [ "$(( BAL_AFTER - BAL_BEFORE ))" -eq "$AMOUNT" ] \
@@ -363,7 +367,7 @@ SIGNER_AFTER="$(lc "$(cast call "$PROXY" 'currentSigner()(address)' --rpc-url "$
 [ "$SIGNER_AFTER" = "$CUR_SIGNER" ]   || fail "currentSigner moved during a mint — a relayer must never be able to do that"
 echo "  balance $BAL_BEFORE -> $BAL_AFTER   (delta $AMOUNT ✓)"
 echo "  supply  $SUP_BEFORE -> $SUP_AFTER"
-echo "  processedDeposits[$BELDEX_TXID] = true ✓"
+echo "  deposit ($BELDEX_TXID, $OUT_INDEX) processed = true ✓"
 echo "  currentSigner unmoved ✓"
 
 say "9 — the same relayer calldata, replayed"
@@ -384,6 +388,7 @@ cat <<EOF
   contract     : $PROXY  (chain id $CHAIN_ID)
   digest       : $DIGEST
   beldex txid  : $BELDEX_TXID
+  output index : $OUT_INDEX
   broadcaster  : $RELAYER_ADDR   (not the signer, not the deployer, not allowlisted)
   tx           : $TX_HASH
 
@@ -392,7 +397,7 @@ cat <<EOF
   liveness     the mint landed from a payload file + \`prepare\` + a gas key, with no bridge
                key and no running relayer service anywhere in the path
   trust        every mutation a relayer could make to the payload — recipient, amount,
-               txid, signature — was rejected at the signer check, and the one field it
+               txid, output index, signature — was rejected at the signer check, and the one field it
                genuinely controls (destination) only lets it misdeliver, never forge
   replay       the same calldata resubmitted: Replay()
 
