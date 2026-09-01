@@ -24,6 +24,8 @@ contract Deploy is Script {
         uint256 bondBackingCapLimit = vm.envUint("BOND_BACKING_CAP_LIMIT");
         uint256 epochSeconds = vm.envUint("EPOCH_SECONDS");
         uint256 rotateTimelock = vm.envUint("ROTATE_TIMELOCK");
+        uint8 beldexNetwork = uint8(vm.envUint("BELDEX_NETWORK"));
+        uint256 minRedeemAmount = vm.envUint("MIN_REDEEM_AMOUNT");
 
         require(admin.code.length > 0, "ADMIN must be a contract");
         require(guardian != address(0) && guardian != initialSigner, "bad GUARDIAN");
@@ -32,12 +34,14 @@ contract Deploy is Script {
         require(windowMintCap > 0 && perTxMax > 0 && perTxMax <= windowMintCap, "bad caps");
         require(windowMintCap <= bondBackingCapLimit / 2, "backing must cover 2x window");
         require(epochSeconds > 0 && rotateTimelock > 0, "zero delay/window");
+        require(beldexNetwork <= 2, "bad Beldex network");
+        require(minRedeemAmount > 0 && minRedeemAmount <= perTxMax, "bad redeem minimum");
 
         vm.startBroadcast();
 
         WrappedBDX impl = new WrappedBDX();
         bytes memory init = abi.encodeCall(
-            WrappedBDX.initialize,
+            WrappedBDX.initializeForNetwork,
             (
                 admin,
                 guardian,
@@ -46,7 +50,9 @@ contract Deploy is Script {
                 perTxMax,
                 bondBackingCapLimit,
                 epochSeconds,
-                rotateTimelock
+                rotateTimelock,
+                beldexNetwork,
+                minRedeemAmount
             )
         );
         ERC1967Proxy proxy = new ERC1967Proxy(address(impl), init);

@@ -17,7 +17,8 @@ import { WrappedBDX } from "../src/WrappedBDX.sol";
 ///           <shell warps anvil past pendingActivateAt>
 ///           forge script ... --sig 'activate()' --broadcast
 ///
-///         Env in: PROXY, NEW_SIGNER, NEW_KEY_EPOCH, ROTATE_RS (0x + 64 bytes of r‖s).
+///         Env in: PROXY, NEW_SIGNER, NEW_KEY_EPOCH, ROTATION_NONCE,
+///         ROTATION_DEADLINE, ROTATE_RS (0x + 64 bytes of r‖s).
 contract DevnetRotate is Script {
     /// secp256k1 group order — for EIP-2 low-S normalisation.
     uint256 internal constant N =
@@ -79,6 +80,8 @@ contract DevnetRotate is Script {
 
         address newSigner = vm.envAddress("NEW_SIGNER");
         uint64 newEpoch = uint64(vm.envUint("NEW_KEY_EPOCH"));
+        uint64 nonce = uint64(vm.envUint("ROTATION_NONCE"));
+        uint256 deadline = vm.envUint("ROTATION_DEADLINE");
         bytes memory rs = vm.envBytes("ROTATE_RS");
 
         address outgoing = w.currentSigner();
@@ -88,6 +91,8 @@ contract DevnetRotate is Script {
         console2.log("current keyEpoch:", uint256(curEpoch));
         console2.log("incoming signer :", newSigner);
         console2.log("new keyEpoch    :", uint256(newEpoch));
+        console2.log("rotation nonce  :", uint256(nonce));
+        console2.log("auth deadline   :", deadline);
 
         // Fail loudly here rather than let the contract's InvalidEpoch/BadSigner do it —
         // a local require names the actual mistake.
@@ -97,17 +102,22 @@ contract DevnetRotate is Script {
             newSigner != outgoing,
             "successor equals the outgoing key - run a *fresh* DKG (cggmp21 0.6.3 has no refresh)"
         );
+        require(nonce == w.rotationNonce() + 1, "ROTATION_NONCE is not the next nonce");
+        require(block.timestamp <= deadline, "rotation authorization expired");
 
         // Mirrors WrappedBDX.rotateSigner exactly. Note the field order differs from the
         // mint digest: epoch precedes signer here.
-        bytes32 digest =
-            keccak256(abi.encode(w.ROTATE_TAG(), block.chainid, address(w), newEpoch, newSigner));
+        bytes32 digest = keccak256(
+            abi.encode(
+                w.ROTATE_TAG(), block.chainid, address(w), newEpoch, newSigner, nonce, deadline
+            )
+        );
         console2.log("rotate digest   :", vm.toString(digest));
 
         bytes memory sig = _assemble(digest, rs, outgoing);
 
         vm.startBroadcast();
-        w.rotateSigner(newSigner, newEpoch, sig);
+        w.rotateSigner(newSigner, newEpoch, nonce, deadline, sig);
         vm.stopBroadcast();
 
         console2.log("");

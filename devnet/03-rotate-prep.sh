@@ -14,6 +14,7 @@ cd "$(dirname "$0")/.."
 
 RPC="${RPC:-http://127.0.0.1:8545}"
 lower() { printf '%s' "$1" | tr 'A-Z' 'a-z'; }
+num()   { printf '%s' "$1" | sed -n 's/^[^0-9]*\([0-9][0-9]*\).*/\1/p'; }
 
 if [ ! -f devnet/mint.env ]; then
   echo "!! devnet/mint.env not found — run ./devnet/01-deploy.sh first" >&2
@@ -44,6 +45,10 @@ CUR_EPOCH="$(printf '%s' "$CUR_EPOCH" | sed -n 's/^\([0-9][0-9]*\).*/\1/p')"
 ROTATE_TAG_ONCHAIN="$(cast call "$PROXY" 'ROTATE_TAG()(bytes32)' --rpc-url "$RPC")"
 ACTIVATE_TAG_ONCHAIN="$(cast call "$PROXY" 'ACTIVATE_TAG()(bytes32)' --rpc-url "$RPC")"
 TIMELOCK="$(cast call "$PROXY" 'rotateTimelock()(uint256)' --rpc-url "$RPC" | sed -n 's/^\([0-9][0-9]*\).*/\1/p')"
+ROTATION_NONCE="$(( $(num "$(cast call "$PROXY" 'rotationNonce()(uint64)' --rpc-url "$RPC")") + 1 ))"
+CHAIN_TIMESTAMP="$(num "$(cast block latest --rpc-url "$RPC" --field timestamp)")"
+ROTATION_AUTH_VALIDITY="${ROTATION_AUTH_VALIDITY:-86400}"
+ROTATION_DEADLINE="$(( CHAIN_TIMESTAMP + ROTATION_AUTH_VALIDITY ))"
 
 NEW_KEY_EPOCH="${NEW_KEY_EPOCH:-$(( CUR_EPOCH + 1 ))}"
 
@@ -66,15 +71,15 @@ fi
 # computed off-tool (pycryptodome keccak-256 of the ASCII domain string), so agreement
 # here means the contract, cast, and a third implementation all concur — the same
 # cross-check that caught nothing in H.2 but is cheap enough to keep.
-EXPECT_TAG=0x1f168494b9c165fdb7617d54f9474d57ca55d8bb4d3f5960fa2e09a81aba1fbd
+EXPECT_TAG=0x4819eb8fbb2b425e5755829a32d36ff423837b6f1190472329f310294e5b69bf
 if [ "$(lower "$ROTATE_TAG_ONCHAIN")" != "$EXPECT_TAG" ]; then
   echo "!! ROTATE_TAG mismatch"
   echo "   on-chain : $ROTATE_TAG_ONCHAIN"
-  echo "   expected : $EXPECT_TAG   (keccak256 of \"BELDEX_BRIDGE_ROTATE_V1\")"
+  echo "   expected : $EXPECT_TAG   (keccak256 of \"BELDEX_BRIDGE_ROTATE_V2\")"
   exit 1
 fi
 # And a third opinion from cast, if this build hashes bare strings as UTF-8.
-CAST_TAG="$(lower "$(cast keccak 'BELDEX_BRIDGE_ROTATE_V1' 2>/dev/null || echo skip)")"
+CAST_TAG="$(lower "$(cast keccak 'BELDEX_BRIDGE_ROTATE_V2' 2>/dev/null || echo skip)")"
 if [ "$CAST_TAG" != "skip" ] && [ "$CAST_TAG" != "$EXPECT_TAG" ]; then
   echo "   note: 'cast keccak' disagreed ($CAST_TAG) — likely a hex-vs-utf8 input"
   echo "         convention difference in this foundry build, not a contract problem."
@@ -82,13 +87,14 @@ fi
 
 # --- the preimage ---------------------------------------------------------------------
 # Mirrors WrappedBDX.rotateSigner:
-#   keccak256(abi.encode(ROTATE_TAG, block.chainid, address(this), newKeyEpoch, newSigner))
-# Five static words = 160 bytes. Note the ordering: epoch BEFORE signer (the mint tuple
+#   keccak256(abi.encode(ROTATE_TAG, chainid, contract, epoch, signer, nonce, deadline))
+# Seven static words = 224 bytes. Note the ordering: epoch BEFORE signer (the mint tuple
 # puts the address first) — getting this backwards produces a valid-looking signature
 # that fails with BadSigner much later.
 PREIMAGE="$(cast abi-encode \
-  'f(bytes32,uint256,address,uint64,address)' \
-  "$ROTATE_TAG_ONCHAIN" "$CHAIN_ID" "$PROXY" "$NEW_KEY_EPOCH" "$NEW_SIGNER")"
+  'f(bytes32,uint256,address,uint64,address,uint64,uint256)' \
+  "$ROTATE_TAG_ONCHAIN" "$CHAIN_ID" "$PROXY" "$NEW_KEY_EPOCH" "$NEW_SIGNER" \
+  "$ROTATION_NONCE" "$ROTATION_DEADLINE")"
 DIGEST="$(cast keccak "$PREIMAGE")"
 
 # The incoming committee signs a distinct liveness proof before it can be activated.
@@ -109,6 +115,8 @@ OUTGOING_SIGNER=$CUR_SIGNER
 CUR_KEY_EPOCH=$CUR_EPOCH
 NEW_SIGNER=$NEW_SIGNER
 NEW_KEY_EPOCH=$NEW_KEY_EPOCH
+ROTATION_NONCE=$ROTATION_NONCE
+ROTATION_DEADLINE=$ROTATION_DEADLINE
 ROTATE_TIMELOCK=$TIMELOCK
 ROTATE_PREIMAGE=$PREIMAGE
 ROTATE_DIGEST=$DIGEST
@@ -124,9 +132,11 @@ cat <<EOF
   contract        : $PROXY  (chain id $CHAIN_ID)
   outgoing signer : $CUR_SIGNER   (keyEpoch $CUR_EPOCH)
   incoming signer : $NEW_SIGNER   (keyEpoch $NEW_KEY_EPOCH)
+  auth nonce       : $ROTATION_NONCE
+  auth deadline    : $ROTATION_DEADLINE  (${ROTATION_AUTH_VALIDITY}s validity)
   ROTATE_TAG      : $ROTATE_TAG_ONCHAIN  (keccak-verified)
   challenge window: ${TIMELOCK}s
-  preimage        : $(( HEXLEN / 2 )) bytes ($HEXLEN hex chars, expect 160 / 320)
+  preimage        : $(( HEXLEN / 2 )) bytes ($HEXLEN hex chars, expect 224 / 448)
   digest          : $DIGEST
 
   written to devnet/rotate.env
@@ -146,8 +156,8 @@ cat <<EOF
 
 EOF
 
-if [ "$HEXLEN" -ne 320 ]; then
-  echo "  !! expected 320 hex chars (160 bytes / 5 ABI words) — got $HEXLEN."
+if [ "$HEXLEN" -ne 448 ]; then
+  echo "  !! expected 448 hex chars (224 bytes / 7 ABI words) — got $HEXLEN."
   echo "     Check the cast version's handling of the uint64 word."
   exit 1
 fi

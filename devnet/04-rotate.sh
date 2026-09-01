@@ -113,7 +113,8 @@ echo ""
 # 3. propose
 # =======================================================================================
 echo "── propose ────────────────────────────────────────────────────────────"
-PROXY="$PROXY" NEW_SIGNER="$NEW_SIGNER" NEW_KEY_EPOCH="$NEW_KEY_EPOCH" ROTATE_RS="$RS" \
+PROXY="$PROXY" NEW_SIGNER="$NEW_SIGNER" NEW_KEY_EPOCH="$NEW_KEY_EPOCH" \
+  ROTATION_NONCE="$ROTATION_NONCE" ROTATION_DEADLINE="$ROTATION_DEADLINE" ROTATE_RS="$RS" \
   forge script script/DevnetRotate.s.sol:DevnetRotate --sig 'propose()' \
     --rpc-url "$RPC" --private-key "$DEPLOYER_KEY" --broadcast -vv
 
@@ -229,8 +230,9 @@ cast logs --rpc-url "$RPC" --address "$PROXY" "$ROTATED_TOPIC" --from-block 0 2>
 # =======================================================================================
 echo ""
 echo "── replay the rotation (must be rejected) ─────────────────────────────"
-STALE="$(cast call "$PROXY" 'rotateSigner(address,uint64,bytes)' \
-          "$NEW_SIGNER" "$NEW_KEY_EPOCH" "${RS}1b" --rpc-url "$RPC" 2>&1 || true)"
+STALE="$(cast call "$PROXY" 'rotateSigner(address,uint64,uint64,uint256,bytes)' \
+          "$NEW_SIGNER" "$NEW_KEY_EPOCH" "$ROTATION_NONCE" "$ROTATION_DEADLINE" \
+          "${RS}1b" --rpc-url "$RPC" 2>&1 || true)"
 case "$STALE" in
   *InvalidEpoch*)          echo "-> InvalidEpoch()  anti-rollback holds" ;;
   *BadSigner*|*61330e93*)  echo "-> BadSigner()   (rejected, though on the signature not the epoch —" ;

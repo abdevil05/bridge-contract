@@ -19,6 +19,14 @@ contract WrappedBDXAddressHarness is WrappedBDX {
     function validAddress(string calldata value) external pure returns (bool) {
         return _isValidMainnetBeldexAddress(bytes(value));
     }
+
+    function validAddressForNetwork(string calldata value, uint8 network)
+        external
+        pure
+        returns (bool)
+    {
+        return _isValidBeldexAddress(bytes(value), network);
+    }
 }
 
 contract WrappedBDXTest is Test {
@@ -46,6 +54,8 @@ contract WrappedBDXTest is Test {
         "83kGvLy7goj6i8totRApfb6i8totRApfb6i8totRApfb6i8totRApfb6i8totRApfb6i8totRApfb6i8totRApfb4r4r4YR";
     string internal constant VALID_BDX_INTEGRATED =
         "4DGKGVvUGwL9ZhqiL8FjVt9ZhqiL8FjVt9ZhqiL8FjVt9ZhqiL8FjVt9ZhqiL8FjVt9ZhqiL8FjVt9ZhqiL8FjVt9XoXC9Kh3Gz1vFG2Nb";
+    string internal constant VALID_DEVNET_BDX_ADDRESS =
+        "52Uf16SYAhv3rZwuSi5uqJ3rZwuSi5uqJ3rZwuSi5uqJ3rZwuSi5uqJ3rZwuSi5uqJ3rZwuSi5uqJ3rZwuSi5uqJ2yfJf3y";
 
     function setUp() public {
         committee = vm.addr(committeePk);
@@ -103,7 +113,21 @@ contract WrappedBDXTest is Test {
     }
 
     function _rotateDigest(uint64 newEpoch, address newSigner) internal view returns (bytes32) {
-        return keccak256(abi.encode(w.ROTATE_TAG(), block.chainid, address(w), newEpoch, newSigner));
+        return keccak256(
+            abi.encode(
+                w.ROTATE_TAG(),
+                block.chainid,
+                address(w),
+                newEpoch,
+                newSigner,
+                uint64(1),
+                block.timestamp + 1 days
+            )
+        );
+    }
+
+    function _rotateSigner(address newSigner, uint64 newEpoch, bytes memory sig) internal {
+        w.rotateSigner(newSigner, newEpoch, 1, block.timestamp + 1 days, sig);
     }
 
     function _activateDigest(uint64 newEpoch, address newSigner) internal view returns (bytes32) {
@@ -125,7 +149,7 @@ contract WrappedBDXTest is Test {
     // =================================================================================
     function test_MintTag_isKeccakOfDomainString() public view {
         assertEq(w.MINT_TAG(), keccak256("BELDEX_BRIDGE_MINT_V2"));
-        assertEq(w.ROTATE_TAG(), keccak256("BELDEX_BRIDGE_ROTATE_V1"));
+        assertEq(w.ROTATE_TAG(), keccak256("BELDEX_BRIDGE_ROTATE_V2"));
         assertEq(w.ACTIVATE_TAG(), keccak256("BELDEX_BRIDGE_ACTIVATE_V1"));
         assertEq(w.decimals(), 9);
     }
@@ -383,6 +407,55 @@ contract WrappedBDXTest is Test {
         assertEq(w.balanceOf(alice), 0);
     }
 
+    function test_Redeem_networkPolicyIsExplicit() public {
+        WrappedBDXAddressHarness harness = new WrappedBDXAddressHarness();
+        assertTrue(
+            harness.validAddressForNetwork(VALID_DEVNET_BDX_ADDRESS, harness.BELDEX_DEVNET())
+        );
+        assertFalse(
+            harness.validAddressForNetwork(VALID_DEVNET_BDX_ADDRESS, harness.BELDEX_MAINNET())
+        );
+
+        WrappedBDX devImpl = new WrappedBDX();
+        bytes memory init = abi.encodeCall(
+            WrappedBDX.initializeForNetwork,
+            (
+                admin,
+                guardian,
+                committee,
+                WINDOW_CAP,
+                PER_TX_MAX,
+                BOND_LIMIT,
+                EPOCH_SECONDS,
+                ROTATE_TIMELOCK,
+                uint8(2),
+                COIN
+            )
+        );
+        WrappedBDX dev = WrappedBDX(address(new ERC1967Proxy(address(devImpl), init)));
+        assertEq(dev.beldexNetwork(), dev.BELDEX_DEVNET());
+        assertEq(dev.minRedeemAmount(), COIN);
+
+        deal(address(dev), alice, 2 * COIN, true);
+        vm.prank(alice);
+        dev.redeemToNative(COIN, VALID_DEVNET_BDX_ADDRESS);
+        assertEq(dev.balanceOf(alice), COIN);
+    }
+
+    function test_Redeem_minimumBoundsPermanentReleaseStateGrowth() public {
+        vm.prank(admin);
+        w.setMinimumRedeemAmount(COIN);
+        deal(address(w), alice, COIN, true);
+
+        vm.prank(alice);
+        vm.expectRevert(WrappedBDX.BelowMinimumRedeem.selector);
+        w.redeemToNative(COIN - 1, VALID_BDX_ADDRESS);
+
+        vm.prank(admin);
+        vm.expectRevert(WrappedBDX.InvalidConfiguration.selector);
+        w.setMinimumRedeemAmount(PER_TX_MAX + 1);
+    }
+
     function test_Redeem_rejectsBadChecksumBeforeBurn() public {
         bytes32 txid = keccak256("fund-bad-checksum");
         w.mint(alice, 2 * COIN, txid, 0, _mintSig(committeePk, alice, 2 * COIN, txid));
@@ -411,7 +484,7 @@ contract WrappedBDXTest is Test {
         address newSigner = vm.addr(0xD00D);
         bytes memory rot = _sign(committeePk, _rotateDigest(2, newSigner));
         vm.expectRevert(); // EnforcedPause
-        w.rotateSigner(newSigner, 2, rot);
+        _rotateSigner(newSigner, 2, rot);
 
         // Timelocked governance retains the deliberate repair path while paused.
         vm.prank(admin);
@@ -456,6 +529,8 @@ contract WrappedBDXTest is Test {
         w.pause();
         vm.expectRevert(WrappedBDX.NotAdmin.selector);
         w.setCaps(1, 1);
+        vm.expectRevert(WrappedBDX.NotAdmin.selector);
+        w.setMinimumRedeemAmount(1);
         vm.expectRevert(WrappedBDX.NotAdmin.selector);
         w.addSigner(alice);
     }
@@ -547,7 +622,7 @@ contract WrappedBDXTest is Test {
         bytes memory rot = _sign(committeePk, _rotateDigest(2, newSigner));
 
         vm.prank(relayer);
-        w.rotateSigner(newSigner, 2, rot);
+        _rotateSigner(newSigner, 2, rot);
         assertEq(w.pendingSigner(), newSigner);
 
         // Before the window elapses, activation reverts.
@@ -580,13 +655,13 @@ contract WrappedBDXTest is Test {
         // keyEpoch is 1; proposals must be exactly the next epoch.
         bytes memory rot = _sign(committeePk, _rotateDigest(1, newSigner));
         vm.expectRevert(WrappedBDX.InvalidEpoch.selector);
-        w.rotateSigner(newSigner, 1, rot);
+        _rotateSigner(newSigner, 1, rot);
     }
 
     function test_Rotation_cannotAdvanceEpochWithoutChangingKey() public {
         bytes memory rot = _sign(committeePk, _rotateDigest(2, committee));
         vm.expectRevert(WrappedBDX.InvalidConfiguration.selector);
-        w.rotateSigner(committee, 2, rot);
+        _rotateSigner(committee, 2, rot);
 
         vm.prank(admin);
         vm.expectRevert(WrappedBDX.InvalidConfiguration.selector);
@@ -597,11 +672,19 @@ contract WrappedBDXTest is Test {
         (, address newSigner) = _newSignerPair();
         // Sign a rotate digest bound to a DIFFERENT contract address.
         bytes32 foreign = keccak256(
-            abi.encode(w.ROTATE_TAG(), block.chainid, address(0xDEAD), uint64(2), newSigner)
+            abi.encode(
+                w.ROTATE_TAG(),
+                block.chainid,
+                address(0xDEAD),
+                uint64(2),
+                newSigner,
+                uint64(1),
+                block.timestamp + 1 days
+            )
         );
         bytes memory rot = _sign(committeePk, foreign);
         vm.expectRevert(WrappedBDX.BadSigner.selector);
-        w.rotateSigner(newSigner, 2, rot);
+        _rotateSigner(newSigner, 2, rot);
     }
 
     function test_Rotation_notByCurrentSigner_reverts() public {
@@ -609,21 +692,21 @@ contract WrappedBDXTest is Test {
         // Signed by a non-committee key.
         bytes memory rot = _sign(0xBADBAD, _rotateDigest(2, newSigner));
         vm.expectRevert(WrappedBDX.BadSigner.selector);
-        w.rotateSigner(newSigner, 2, rot);
+        _rotateSigner(newSigner, 2, rot);
     }
 
     function test_Rotation_cannotOverwritePendingProposal() public {
         (, address first) = _newSignerPair();
-        w.rotateSigner(first, 2, _sign(committeePk, _rotateDigest(2, first)));
+        _rotateSigner(first, 2, _sign(committeePk, _rotateDigest(2, first)));
         address second = vm.addr(0x2222);
         bytes memory secondSig = _sign(committeePk, _rotateDigest(2, second));
         vm.expectRevert(WrappedBDX.PendingRotationExists.selector);
-        w.rotateSigner(second, 2, secondSig);
+        _rotateSigner(second, 2, secondSig);
     }
 
     function test_Rotation_requiresIncomingProof() public {
         (, address newSigner) = _newSignerPair();
-        w.rotateSigner(newSigner, 2, _sign(committeePk, _rotateDigest(2, newSigner)));
+        _rotateSigner(newSigner, 2, _sign(committeePk, _rotateDigest(2, newSigner)));
         vm.warp(w.pendingActivateAt());
         bytes memory wrong = _activateSig(committeePk, 2, newSigner);
         vm.expectRevert(WrappedBDX.IncomingNotReady.selector);
@@ -634,13 +717,50 @@ contract WrappedBDXTest is Test {
     function test_Rotation_vetoedProposalCannotBeReplayed() public {
         (, address newSigner) = _newSignerPair();
         bytes memory proposal = _sign(committeePk, _rotateDigest(2, newSigner));
-        w.rotateSigner(newSigner, 2, proposal);
+        _rotateSigner(newSigner, 2, proposal);
         vm.prank(guardian);
         w.vetoRotation();
 
         vm.expectRevert(WrappedBDX.RotationIsVetoed.selector);
-        w.rotateSigner(newSigner, 2, proposal);
+        _rotateSigner(newSigner, 2, proposal);
         assertEq(w.pendingActivateAt(), 0);
+    }
+
+    function test_Rotation_expiredAuthorizationReverts() public {
+        (, address newSigner) = _newSignerPair();
+        uint64 nonce = 1;
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes32 digest = keccak256(
+            abi.encode(
+                w.ROTATE_TAG(), block.chainid, address(w), uint64(2), newSigner, nonce, deadline
+            )
+        );
+        bytes memory proposal = _sign(committeePk, digest);
+        vm.warp(deadline + 1);
+        vm.expectRevert(WrappedBDX.RotationAuthorizationExpired.selector);
+        w.rotateSigner(newSigner, 2, nonce, deadline, proposal);
+    }
+
+    function test_Rotation_nonceMakesClearedVetoAuthorizationSingleUse() public {
+        (, address newSigner) = _newSignerPair();
+        uint64 nonce = 1;
+        uint256 deadline = block.timestamp + 1 days;
+        bytes32 digest = keccak256(
+            abi.encode(
+                w.ROTATE_TAG(), block.chainid, address(w), uint64(2), newSigner, nonce, deadline
+            )
+        );
+        bytes memory proposal = _sign(committeePk, digest);
+        w.rotateSigner(newSigner, 2, nonce, deadline, proposal);
+        assertEq(w.rotationNonce(), nonce);
+
+        vm.prank(guardian);
+        w.vetoRotation();
+        vm.prank(admin);
+        w.clearVetoedProposal(newSigner, 2);
+
+        vm.expectRevert(WrappedBDX.InvalidRotationNonce.selector);
+        w.rotateSigner(newSigner, 2, nonce, deadline, proposal);
     }
 
     function test_RecoverySignerAutomaticallyExpiresOnRotation() public {
@@ -651,7 +771,7 @@ contract WrappedBDXTest is Test {
         assertTrue(w.isAuthorizedSigner(recovery));
 
         (uint256 newPk, address newSigner) = _newSignerPair();
-        w.rotateSigner(newSigner, 2, _sign(committeePk, _rotateDigest(2, newSigner)));
+        _rotateSigner(newSigner, 2, _sign(committeePk, _rotateDigest(2, newSigner)));
         vm.warp(w.pendingActivateAt());
         w.activateRotation(_activateSig(newPk, 2, newSigner));
         assertFalse(w.isAuthorizedSigner(recovery));
@@ -665,7 +785,7 @@ contract WrappedBDXTest is Test {
     function test_Rotation_vetoedCannotActivate() public {
         (uint256 newPk, address newSigner) = _newSignerPair();
         bytes memory rot = _sign(committeePk, _rotateDigest(2, newSigner));
-        w.rotateSigner(newSigner, 2, rot);
+        _rotateSigner(newSigner, 2, rot);
 
         vm.prank(admin);
         w.vetoRotation();

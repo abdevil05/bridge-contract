@@ -15,7 +15,8 @@ import { TimelockController } from "@openzeppelin/contracts/governance/TimelockC
 /// window (S8/S11).
 ///
 ///   MIN_DELAY, PROPOSER (governance multisig), GUARDIAN, INITIAL_SIGNER, WINDOW_MINT_CAP, PER_TX_MAX,
-///   BOND_BACKING_CAP_LIMIT, EPOCH_SECONDS, ROTATE_TIMELOCK  (all via env)
+///   BOND_BACKING_CAP_LIMIT, EPOCH_SECONDS, ROTATE_TIMELOCK, BELDEX_NETWORK,
+///   MIN_REDEEM_AMOUNT (all via env; the final two default to mainnet / one atomic unit)
 contract DeployWithTimelock is Script {
     function run() external {
         uint256 minDelay = vm.envUint("MIN_DELAY");
@@ -27,6 +28,8 @@ contract DeployWithTimelock is Script {
         uint256 bondBackingCapLimit = vm.envUint("BOND_BACKING_CAP_LIMIT");
         uint256 epochSeconds = vm.envUint("EPOCH_SECONDS");
         uint256 rotateTimelock = vm.envUint("ROTATE_TIMELOCK");
+        uint8 beldexNetwork = uint8(vm.envOr("BELDEX_NETWORK", uint256(0)));
+        uint256 minRedeemAmount = vm.envOr("MIN_REDEEM_AMOUNT", uint256(1));
 
         require(minDelay > 0 && rotateTimelock > 0 && epochSeconds > 0, "zero delay/window");
         require(proposer != address(0) && guardian != address(0), "zero governance");
@@ -34,6 +37,8 @@ contract DeployWithTimelock is Script {
         require(proposer != guardian, "proposer=guardian");
         require(windowMintCap > 0 && perTxMax > 0 && perTxMax <= windowMintCap, "bad caps");
         require(windowMintCap <= bondBackingCapLimit / 2, "backing must cover 2x window");
+        require(beldexNetwork <= 2, "bad Beldex network");
+        require(minRedeemAmount > 0 && minRedeemAmount <= perTxMax, "bad redeem minimum");
 
         vm.startBroadcast();
 
@@ -52,7 +57,7 @@ contract DeployWithTimelock is Script {
 
         WrappedBDX impl = new WrappedBDX();
         bytes memory init = abi.encodeCall(
-            WrappedBDX.initialize,
+            WrappedBDX.initializeForNetwork,
             (
                 address(timelock), // admin = the timelock
                 guardian,
@@ -61,7 +66,9 @@ contract DeployWithTimelock is Script {
                 perTxMax,
                 bondBackingCapLimit,
                 epochSeconds,
-                rotateTimelock
+                rotateTimelock,
+                beldexNetwork,
+                minRedeemAmount
             )
         );
         ERC1967Proxy proxy = new ERC1967Proxy(address(impl), init);

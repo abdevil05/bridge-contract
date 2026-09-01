@@ -12,6 +12,7 @@ set -euo pipefail
 export PATH="$HOME/.foundry/bin:$PATH"
 cd "$(cd "$(dirname "$0")/.." && pwd)"
 mkdir -p devnet
+umask 077
 
 # ── inputs ───────────────────────────────────────────────────────────────────
 # The wBDX signer address = the CURRENT committee's Pevm group address (derive it from
@@ -29,7 +30,9 @@ if [ -z "$SIGNER_ADDR" ]; then
   exit 1
 fi
 
-# anvil dev account #0 — deployer + admin + mint recipient.
+# Anvil dev account #0 deploys and proposes timelocked operations. The contract admin is
+# the TimelockController deployed below, not this EOA. These public keys remain suitable
+# only for a disposable localhost chain.
 DEPLOYER_KEY="${DEPLOYER_KEY:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}"
 DEPLOYER="${DEPLOYER:-0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266}"
 # anvil account #1; intentionally distinct from the deployer/admin and committee signer.
@@ -43,6 +46,9 @@ WINDOW_MINT_CAP="${WINDOW_MINT_CAP:-10000000000000}"       # 10,000 BDX / window
 BOND_BACKING_CAP_LIMIT="${BOND_BACKING_CAP_LIMIT:-100000000000000}"  # 100,000 BDX
 EPOCH_SECONDS="${EPOCH_SECONDS:-86400}"
 ROTATE_TIMELOCK="${ROTATE_TIMELOCK:-3600}"
+MIN_DELAY="${MIN_DELAY:-3600}"
+BELDEX_NETWORK="${BELDEX_NETWORK:-2}"             # 0 mainnet, 1 testnet, 2 devnet
+MIN_REDEEM_AMOUNT="${MIN_REDEEM_AMOUNT:-1000000000}" # 1 BDX; bounds release-ref growth
 TO="${TO:-$DEPLOYER}"
 # Stand-in for the Beldex deposit txid that backs this mint (the replay key).
 BELDEX_TXID="${BELDEX_TXID:-0x00000000000000000000000000000000000000000000000000000000decafbad}"
@@ -72,36 +78,32 @@ fi
 CHAIN_ID="$(cast chain-id --rpc-url "$RPC")"
 echo "chain id: $CHAIN_ID"
 
-# `forge create` requires --broadcast on newer foundry and rejects it on older.
-BC=""
-forge create --help 2>&1 | grep -q -- '--broadcast' && BC="--broadcast"
-
-# `forge create --json` pretty-prints, so flatten before matching.
-deployed() {
-  printf '%s' "$1" | tr -d ' \t\n' | sed -n 's/.*"deployedTo":"\([^"]*\)".*/\1/p'
+# ── 2–3. timelock + implementation + proxy -----------------------------------
+say "deploy TimelockController + WrappedBDX proxy"
+DEPLOY_OUT="$(
+  MIN_DELAY="$MIN_DELAY" PROPOSER="$DEPLOYER" GUARDIAN="$GUARDIAN" \
+  INITIAL_SIGNER="$SIGNER_ADDR" WINDOW_MINT_CAP="$WINDOW_MINT_CAP" \
+  PER_TX_MAX="$PER_TX_MAX" BOND_BACKING_CAP_LIMIT="$BOND_BACKING_CAP_LIMIT" \
+  EPOCH_SECONDS="$EPOCH_SECONDS" ROTATE_TIMELOCK="$ROTATE_TIMELOCK" \
+  BELDEX_NETWORK="$BELDEX_NETWORK" MIN_REDEEM_AMOUNT="$MIN_REDEEM_AMOUNT" \
+  forge script script/DeployWithTimelock.s.sol:DeployWithTimelock \
+    --rpc-url "$RPC" --private-key "$DEPLOYER_KEY" --broadcast -vv
+)"
+printf '%s\n' "$DEPLOY_OUT"
+address_from_log() {
+  printf '%s\n' "$DEPLOY_OUT" | sed -n "s/.*$1[[:space:]]*:[[:space:]]*\(0x[0-9A-Fa-f]\{40\}\).*/\1/p" | tail -1
 }
-
-# ── 2. implementation ────────────────────────────────────────────────────────
-say "deploy WrappedBDX implementation"
-IMPL_JSON="$(forge create src/WrappedBDX.sol:WrappedBDX \
-  --rpc-url "$RPC" --private-key "$DEPLOYER_KEY" $BC --json)"
-IMPL="$(deployed "$IMPL_JSON")"
-[ -n "$IMPL" ] || { echo "could not parse impl address from: $IMPL_JSON"; exit 1; }
-echo "impl:  $IMPL"
-
-# ── 3. proxy (initialize in the same tx) ─────────────────────────────────────
-say "deploy ERC1967Proxy + initialize"
-INIT="$(cast calldata \
-  'initialize(address,address,address,uint256,uint256,uint256,uint256,uint256)' \
-  "$DEPLOYER" "$GUARDIAN" "$SIGNER_ADDR" "$WINDOW_MINT_CAP" "$PER_TX_MAX" \
-  "$BOND_BACKING_CAP_LIMIT" "$EPOCH_SECONDS" "$ROTATE_TIMELOCK")"
-PROXY_JSON="$(forge create \
-  lib/openzeppelin-contracts/contracts/proxy/ERC1967/ERC1967Proxy.sol:ERC1967Proxy \
-  --rpc-url "$RPC" --private-key "$DEPLOYER_KEY" $BC --json \
-  --constructor-args "$IMPL" "$INIT")"
-PROXY="$(deployed "$PROXY_JSON")"
-[ -n "$PROXY" ] || { echo "could not parse proxy address from: $PROXY_JSON"; exit 1; }
-echo "proxy: $PROXY"
+TIMELOCK="$(address_from_log 'TimelockController')"
+IMPL="$(address_from_log 'WrappedBDX impl')"
+PROXY="$(address_from_log 'WrappedBDX proxy')"
+if [ -z "$TIMELOCK" ] || [ -z "$IMPL" ] || [ -z "$PROXY" ]; then
+  echo "!! could not parse one or more deployment addresses from forge output" >&2
+  exit 1
+fi
+ADMIN="$TIMELOCK"
+echo "timelock: $TIMELOCK"
+echo "impl:     $IMPL"
+echo "proxy:    $PROXY"
 
 # ── 4. sanity-read the live state ────────────────────────────────────────────
 say "on-chain state"
@@ -113,6 +115,9 @@ printf 'decimals    : %s\n' "$(cast call "$PROXY" 'decimals()(uint8)' --rpc-url 
 printf 'MINT_TAG    : %s\n' "$MINT_TAG"
 printf 'currentSigner: %s\n' "$CUR_SIGNER"
 printf 'guardian     : %s\n' "$(cast call "$PROXY" 'guardian()(address)' --rpc-url "$RPC")"
+printf 'admin        : %s\n' "$(cast call "$PROXY" 'admin()(address)' --rpc-url "$RPC")"
+printf 'BDX network  : %s\n' "$(cast call "$PROXY" 'beldexNetwork()(uint8)' --rpc-url "$RPC")"
+printf 'min redeem   : %s\n' "$(cast call "$PROXY" 'minRedeemAmount()(uint256)' --rpc-url "$RPC")"
 printf 'keyEpoch     : %s\n' "$KEY_EPOCH"
 if [ "$(echo "$CUR_SIGNER" | tr 'A-Z' 'a-z')" != "$(echo "$SIGNER_ADDR" | tr 'A-Z' 'a-z')" ]; then
   echo "!! currentSigner != the committee Pevm address"; exit 1
@@ -140,10 +145,14 @@ RPC=$RPC
 CHAIN_ID=$CHAIN_ID
 IMPL=$IMPL
 PROXY=$PROXY
+TIMELOCK=$TIMELOCK
+ADMIN=$ADMIN
 SIGNER_ADDR=$SIGNER_ADDR
 GUARDIAN=$GUARDIAN
 DEPLOYER=$DEPLOYER
 DEPLOYER_KEY=$DEPLOYER_KEY
+BELDEX_NETWORK=$BELDEX_NETWORK
+MIN_REDEEM_AMOUNT=$MIN_REDEEM_AMOUNT
 TO=$TO
 AMOUNT=$AMOUNT
 BELDEX_TXID=$BELDEX_TXID
@@ -153,6 +162,7 @@ MINT_TAG=$MINT_TAG
 PREIMAGE=$PREIMAGE
 DIGEST=$DIGEST
 EOF
+chmod 600 devnet/mint.env
 echo
 echo "wrote devnet/mint.env"
 
