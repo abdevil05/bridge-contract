@@ -394,17 +394,89 @@ contract WrappedBDXTest is Test {
         assertEq(w.balanceOf(alice), 2 * COIN);
     }
 
-    function test_Redeem_acceptsChecksummedMainnetSubaddressAndIntegratedAddress() public {
-        WrappedBDXAddressHarness harness = new WrappedBDXAddressHarness();
-        assertTrue(harness.validAddress(VALID_BDX_SUBADDRESS), "valid subaddress rejected");
-        assertTrue(harness.validAddress(VALID_BDX_INTEGRATED), "valid integrated address rejected");
-        bytes32 txid = keccak256("fund-valid-address-types");
-        w.mint(alice, 2 * COIN, txid, 0, _mintSig(committeePk, alice, 2 * COIN, txid));
-        vm.startPrank(alice);
-        w.redeemToNative(1 * COIN, VALID_BDX_SUBADDRESS);
-        w.redeemToNative(1 * COIN, VALID_BDX_INTEGRATED);
-        vm.stopPrank();
-        assertEq(w.balanceOf(alice), 0);
+    // These fixtures use the native network prefixes and valid CryptoNote checksums.
+    // Rejection is based on unsupported payout type, not a malformed address.
+    function test_Redeem_rejectsChecksummedMainnetUnsupportedTypesBeforeBurn() public {
+        _assertUnsupportedRecipients(w, VALID_BDX_SUBADDRESS, VALID_BDX_INTEGRATED);
+    }
+
+    function _networkToken(uint8 network) internal returns (WrappedBDX) {
+        WrappedBDX impl = new WrappedBDX();
+        bytes memory init = abi.encodeCall(
+            WrappedBDX.initializeForNetwork,
+            (
+                admin,
+                guardian,
+                committee,
+                WINDOW_CAP,
+                PER_TX_MAX,
+                BOND_LIMIT,
+                EPOCH_SECONDS,
+                ROTATE_TIMELOCK,
+                network,
+                COIN
+            )
+        );
+        return WrappedBDX(address(new ERC1967Proxy(address(impl), init)));
+    }
+
+    function _assertUnsupportedRecipients(
+        WrappedBDX token,
+        string memory subaddress,
+        string memory integrated
+    ) internal {
+        deal(address(token), alice, 2 * COIN, true);
+        uint256 supplyBefore = token.totalSupply();
+        string[2] memory recipients = [subaddress, integrated];
+        for (uint256 i; i < recipients.length; ++i) {
+            vm.recordLogs();
+            vm.prank(alice);
+            vm.expectRevert(WrappedBDX.BadRedeemAddress.selector);
+            token.redeemToNative(COIN, recipients[i]);
+            assertEq(token.balanceOf(alice), 2 * COIN, "rejection must preserve balance");
+            assertEq(token.totalSupply(), supplyBefore, "rejection must preserve supply");
+            assertEq(vm.getRecordedLogs().length, 0, "rejection must emit no burn/request");
+        }
+    }
+
+    function test_Redeem_rejectsChecksummedTestnetUnsupportedTypesBeforeBurn() public {
+        _assertUnsupportedRecipients(
+            _networkToken(1),
+            "Ba7ut1xB2i69ZhqiL8FjVt9ZhqiL8FjVt9ZhqiL8FjVt9ZhqiL8FjVt9ZhqiL8FjVt9ZhqiL8FjVt9ZhqiL8FjVt6pT3Cby",
+            "A4orkkajZJS9ZhqiL8FjVt9ZhqiL8FjVt9ZhqiL8FjVt9ZhqiL8FjVt9ZhqiL8FjVt9ZhqiL8FjVt9ZhqiL8FjVt9aMMP3uxJnP8h3L6Cy"
+        );
+    }
+
+    function test_Redeem_acceptsChecksummedTestnetStandardAddress() public {
+        WrappedBDX token = _networkToken(1);
+        deal(address(token), alice, COIN, true);
+        vm.prank(alice);
+        token.redeemToNative(
+            COIN,
+            "9u7BjwmEx2v9ZhqiL8FjVt9ZhqiL8FjVt9ZhqiL8FjVt9ZhqiL8FjVt9ZhqiL8FjVt9ZhqiL8FjVt9ZhqiL8FjVt6qvUpsa"
+        );
+        assertEq(token.balanceOf(alice), 0);
+        assertEq(token.totalSupply(), 0);
+    }
+
+    function test_Redeem_rejectsChecksummedDevnetUnsupportedTypesBeforeBurn() public {
+        _assertUnsupportedRecipients(
+            _networkToken(2),
+            "74BkWDqrcV89ZhqiL8FjVt9ZhqiL8FjVt9ZhqiL8FjVt9ZhqiL8FjVt9ZhqiL8FjVt9ZhqiL8FjVt9ZhqiL8FjVt6rojW6r",
+            "5DUMMLqRvYS9ZhqiL8FjVt9ZhqiL8FjVt9ZhqiL8FjVt9ZhqiL8FjVt9ZhqiL8FjVt9ZhqiL8FjVt9ZhqiL8FjVt9aMMP3uxJnP8hqH6sZ"
+        );
+    }
+
+    function test_Redeem_acceptsChecksummedDevnetStandardAddress() public {
+        WrappedBDX token = _networkToken(2);
+        deal(address(token), alice, COIN, true);
+        vm.prank(alice);
+        token.redeemToNative(
+            COIN,
+            "53mgLY1wKGv9ZhqiL8FjVt9ZhqiL8FjVt9ZhqiL8FjVt9ZhqiL8FjVt9ZhqiL8FjVt9ZhqiL8FjVt9ZhqiL8FjVt6noo51d"
+        );
+        assertEq(token.balanceOf(alice), 0);
+        assertEq(token.totalSupply(), 0);
     }
 
     function test_Redeem_networkPolicyIsExplicit() public {

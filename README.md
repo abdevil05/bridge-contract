@@ -75,8 +75,10 @@ repository.
   challenge period, persistent vetoes, and scoped recovery signers.
 - Separate timelocked administration and guardian duties, two-step admin transfer, and
   guarded UUPS upgrades.
-- Full CryptoNote block-Base58 decoding for mainnet Beldex standard, subaddress, and
-  integrated-address formats, including prefix and checksum validation before burning.
+- Full CryptoNote block-Base58 decoding for standard Beldex addresses on the configured
+  mainnet, testnet or devnet network, including prefix and checksum validation before
+  burning. Subaddresses and integrated addresses are rejected because the native
+  gateway payout builder does not support them.
 - Nine decimals so one wBDX atomic unit equals one BDX atomic unit.
 
 `redeemToNative` emits `RedeemToNative(address indexed from, uint256 amount,
@@ -93,3 +95,17 @@ bytes beldexAddress)`, matching the event decoded by the EVM watcher.
 - The contract validates mainnet Beldex recipient formats. A Beldex devnet using devnet
   address prefixes needs an explicit test-only compatibility plan.
 - An independent end-to-end security review remains required before mainnet deployment.
+
+
+### Redemption address compatibility upgrade
+
+`redeemToNative` accepts only standard addresses for the configured Beldex network.
+A correctly checksummed subaddress or integrated address reverts with
+`BadRedeemAddress` before the balance or supply changes and before a redemption
+request is emitted. Applications should request a standard recipient address.
+
+Existing proxies need a governance-authorized implementation upgrade to receive
+this correction. No storage layout, initializer, event or external function ABI
+changes are required. This source change is not a deployment, and it cannot undo
+burns made to unsupported addresses before the upgrade. Those requests require a
+separately reviewed recovery process; do not silently change their recipients.

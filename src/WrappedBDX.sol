@@ -435,7 +435,8 @@ contract WrappedBDX is Initializable, ERC20Upgradeable, PausableUpgradeable, UUP
     ///         The L1 gateway (Phase A.3) enforces the release cap in consensus; here we
     ///         bound by `minRedeemAmount` and `perTxMax`. The address is fully decoded and
     ///         checked against this deployment's configured Beldex network plus its
-    ///         CryptoNote checksum before the irreversible burn.
+    ///         CryptoNote checksum before the irreversible burn. Only standard addresses
+    ///         are supported by the native gateway payout builder.
     function redeemToNative(uint256 amount, string calldata beldexAddress) external whenNotPaused {
         if (amount == 0) revert ZeroAmount();
         if (amount < minRedeemAmount) revert BelowMinimumRedeem();
@@ -459,23 +460,18 @@ contract WrappedBDX is Initializable, ERC20Upgradeable, PausableUpgradeable, UUP
         (bool ok, bytes memory decoded) = _decodeCryptoNoteBase58(encoded);
         if (!ok) return false;
 
-        // Mainnet standard prefix 209 is varint d1 01; subaddress prefix is 42;
-        // integrated-address prefix is 19. The decoded lengths include the four-byte
-        // CryptoNote checksum.
+        // Match the native gateway->wallet builder: it supports standard addresses
+        // only, rejecting subaddresses and integrated payment IDs. Accepting those
+        // here would irreversibly burn tokens for an unfulfillable release.
+        // Mainnet prefix 209 is varint d1 01. Lengths include the 4-byte checksum.
         bool prefixOk;
         if (network == BELDEX_MAINNET) {
             prefixOk =
-                (decoded.length == 70 && uint8(decoded[0]) == 0xd1 && uint8(decoded[1]) == 0x01)
-                    || (decoded.length == 69 && uint8(decoded[0]) == 42)
-                    || (decoded.length == 77 && uint8(decoded[0]) == 19);
+                decoded.length == 70 && uint8(decoded[0]) == 0xd1 && uint8(decoded[1]) == 0x01;
         } else if (network == BELDEX_TESTNET) {
-            prefixOk = (decoded.length == 69 && uint8(decoded[0]) == 53)
-                || (decoded.length == 69 && uint8(decoded[0]) == 63)
-                || (decoded.length == 77 && uint8(decoded[0]) == 54);
+            prefixOk = decoded.length == 69 && uint8(decoded[0]) == 53;
         } else if (network == BELDEX_DEVNET) {
-            prefixOk = (decoded.length == 69 && uint8(decoded[0]) == 24)
-                || (decoded.length == 69 && uint8(decoded[0]) == 36)
-                || (decoded.length == 77 && uint8(decoded[0]) == 25);
+            prefixOk = decoded.length == 69 && uint8(decoded[0]) == 24;
         } else {
             return false;
         }
