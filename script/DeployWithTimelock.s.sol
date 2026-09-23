@@ -6,39 +6,50 @@ import { WrappedBDX } from "../src/WrappedBDX.sol";
 import { ERC1967Proxy } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import { TimelockController } from "@openzeppelin/contracts/governance/TimelockController.sol";
 
-/// Production deploy (Phase G.2): the wBDX `admin` is an OpenZeppelin `TimelockController`,
+/// Production deploy (Phase G.2): the wBDX `config.admin` is an OpenZeppelin `TimelockController`,
 /// never an EOA and never a committee signer. The timelock's **proposer** is the governance
 /// multisig (a Safe, passed as `PROPOSER`); executors are open (address(0)) so anyone can
 /// execute an operation once its delay has elapsed — the delay, not the executor, is the
-/// safety property. This makes every admin action (pause, addSigner/removeSigner, setCaps
+/// safety property. This makes every config.admin action (pause, addSigner/removeSigner, setCaps
 /// with the bond-before-caps guard, UUPS upgrade) subject to a public, timelocked review
 /// window (S8/S11).
 ///
 ///   MIN_DELAY, PROPOSER (governance multisig), GUARDIAN, INITIAL_SIGNER, WINDOW_MINT_CAP, PER_TX_MAX,
 ///   BOND_BACKING_CAP_LIMIT, EPOCH_SECONDS, ROTATE_TIMELOCK, BELDEX_NETWORK,
-///   MIN_REDEEM_AMOUNT (all via env; the final two default to mainnet / one atomic unit)
+///   MIN_REDEEM_AMOUNT, REDEMPTION_FEE (atomic BDX; minimum must exceed the fee).
 contract DeployWithTimelock is Script {
     function run() external {
+        WrappedBDX.InitializationConfig memory config;
         uint256 minDelay = vm.envUint("MIN_DELAY");
         address proposer = vm.envAddress("PROPOSER"); // governance multisig
-        address guardian = vm.envAddress("GUARDIAN"); // fast pause/veto multisig
-        address initialSigner = vm.envAddress("INITIAL_SIGNER");
-        uint256 windowMintCap = vm.envUint("WINDOW_MINT_CAP");
-        uint256 perTxMax = vm.envUint("PER_TX_MAX");
-        uint256 bondBackingCapLimit = vm.envUint("BOND_BACKING_CAP_LIMIT");
-        uint256 epochSeconds = vm.envUint("EPOCH_SECONDS");
-        uint256 rotateTimelock = vm.envUint("ROTATE_TIMELOCK");
-        uint8 beldexNetwork = uint8(vm.envOr("BELDEX_NETWORK", uint256(0)));
-        uint256 minRedeemAmount = vm.envOr("MIN_REDEEM_AMOUNT", uint256(1));
+        config.guardian = vm.envAddress("GUARDIAN"); // fast pause/veto multisig
+        config.signer = vm.envAddress("INITIAL_SIGNER");
+        config.windowCap = vm.envUint("WINDOW_MINT_CAP");
+        config.txMax = vm.envUint("PER_TX_MAX");
+        config.backing = vm.envUint("BOND_BACKING_CAP_LIMIT");
+        config.epochSeconds = vm.envUint("EPOCH_SECONDS");
+        config.rotationDelay = vm.envUint("ROTATE_TIMELOCK");
+        config.network = uint8(vm.envOr("BELDEX_NETWORK", uint256(0)));
+        config.minimum = vm.envOr("MIN_REDEEM_AMOUNT", uint256(1));
 
-        require(minDelay > 0 && rotateTimelock > 0 && epochSeconds > 0, "zero delay/window");
-        require(proposer != address(0) && guardian != address(0), "zero governance");
-        require(proposer != initialSigner && guardian != initialSigner, "governance=signer");
-        require(proposer != guardian, "proposer=guardian");
-        require(windowMintCap > 0 && perTxMax > 0 && perTxMax <= windowMintCap, "bad caps");
-        require(windowMintCap <= bondBackingCapLimit / 2, "backing must cover 2x window");
-        require(beldexNetwork <= 2, "bad Beldex network");
-        require(minRedeemAmount > 0 && minRedeemAmount <= perTxMax, "bad redeem minimum");
+        require(
+            minDelay > 0 && config.rotationDelay > 0 && config.epochSeconds > 0, "zero delay/window"
+        );
+        require(proposer != address(0) && config.guardian != address(0), "zero governance");
+        require(proposer != config.signer && config.guardian != config.signer, "governance=signer");
+        require(proposer != config.guardian, "proposer=guardian");
+        require(
+            config.windowCap > 0 && config.txMax > 0 && config.txMax <= config.windowCap, "bad caps"
+        );
+        require(config.windowCap <= config.backing / 2, "backing must cover 2x window");
+        require(config.network <= 2, "bad Beldex network");
+        require(config.minimum > 0 && config.minimum <= config.txMax, "bad redeem minimum");
+
+        uint256 redemptionFee = vm.envUint("REDEMPTION_FEE");
+        require(
+            config.minimum > redemptionFee && config.minimum <= 50_000 * 1e9,
+            "bad redemption fee/minimum"
+        );
 
         vm.startBroadcast();
 
@@ -56,21 +67,9 @@ contract DeployWithTimelock is Script {
         );
 
         WrappedBDX impl = new WrappedBDX();
-        bytes memory init = abi.encodeCall(
-            WrappedBDX.initializeForNetwork,
-            (
-                address(timelock), // admin = the timelock
-                guardian,
-                initialSigner,
-                windowMintCap,
-                perTxMax,
-                bondBackingCapLimit,
-                epochSeconds,
-                rotateTimelock,
-                beldexNetwork,
-                minRedeemAmount
-            )
-        );
+        config.admin = address(timelock);
+        bytes memory init =
+            abi.encodeCall(WrappedBDX.initializeForNetworkWithFee, (config, redemptionFee));
         ERC1967Proxy proxy = new ERC1967Proxy(address(impl), init);
 
         vm.stopBroadcast();

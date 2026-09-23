@@ -109,3 +109,34 @@ this correction. No storage layout, initializer, event or external function ABI
 changes are required. This source change is not a deployment, and it cannot undo
 burns made to unsupported addresses before the upgrade. Those requests require a
 separately reviewed recovery process; do not silently change their recipients.
+
+
+### Redemption amount and fee policy (V4)
+
+A burn must be no larger than both `perTxMax` and the native consensus debit
+maximum of **50,000 BDX** (`50_000_000_000_000` atomic units). Mint caps can be
+larger; changing them never raises the redemption consensus ceiling.
+
+The deployment has one fixed `redemptionFee` in atomic BDX. The minimum redemption
+must exceed that fee, so the recipient receives at least one atomic unit after
+fees. Minimum/cap setters and initialization validate this relationship. There
+is no fee setter: silently raising a fee would change already accepted payouts.
+Any future fee-policy upgrade needs an explicit plan for outstanding requests.
+
+New deployments use `initializeForNetworkWithFee(InitializationConfig,uint256)`;
+both deployment scripts require `REDEMPTION_FEE`. Choose a fee accepted by the
+native network, and set `MIN_REDEEM_AMOUNT > REDEMPTION_FEE`. The existing
+initializer ABIs remain available but leave redemption disabled until V4 setup.
+
+For an existing proxy, review pending burns first, choose the fee consistent with
+its payout policy, and adjust the minimum if needed. Governance should upgrade
+and call `initializeV4(fee)` atomically through `upgradeToAndCall`. V1 proxies
+must first complete the guardian migration. Existing oversized or underfunded
+burns are not repaired by the upgrade and require separate recovery. The two new
+state slots consume reserved storage; existing slots and offsets are unchanged.
+
+Update the implementation approval manifest and all signers together. Updated
+signers read the fixed fee from finalized contract state, build payouts using
+that fee, and refuse conflicting local settings. An unconfigured/old contract
+causes startup to fail closed. The contract and signer changes have not been
+deployed by this repository edit.

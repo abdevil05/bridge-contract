@@ -16,45 +16,41 @@ import { ERC1967Proxy } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy
 ///     --sig 'run()'
 contract Deploy is Script {
     function run() external {
-        address admin = vm.envAddress("ADMIN");
-        address guardian = vm.envAddress("GUARDIAN");
-        address initialSigner = vm.envAddress("INITIAL_SIGNER");
-        uint256 windowMintCap = vm.envUint("WINDOW_MINT_CAP");
-        uint256 perTxMax = vm.envUint("PER_TX_MAX");
-        uint256 bondBackingCapLimit = vm.envUint("BOND_BACKING_CAP_LIMIT");
-        uint256 epochSeconds = vm.envUint("EPOCH_SECONDS");
-        uint256 rotateTimelock = vm.envUint("ROTATE_TIMELOCK");
-        uint8 beldexNetwork = uint8(vm.envUint("BELDEX_NETWORK"));
-        uint256 minRedeemAmount = vm.envUint("MIN_REDEEM_AMOUNT");
+        WrappedBDX.InitializationConfig memory config;
+        config.admin = vm.envAddress("ADMIN");
+        config.guardian = vm.envAddress("GUARDIAN");
+        config.signer = vm.envAddress("INITIAL_SIGNER");
+        config.windowCap = vm.envUint("WINDOW_MINT_CAP");
+        config.txMax = vm.envUint("PER_TX_MAX");
+        config.backing = vm.envUint("BOND_BACKING_CAP_LIMIT");
+        config.epochSeconds = vm.envUint("EPOCH_SECONDS");
+        config.rotationDelay = vm.envUint("ROTATE_TIMELOCK");
+        config.network = uint8(vm.envUint("BELDEX_NETWORK"));
+        config.minimum = vm.envUint("MIN_REDEEM_AMOUNT");
 
-        require(admin.code.length > 0, "ADMIN must be a contract");
-        require(guardian != address(0) && guardian != initialSigner, "bad GUARDIAN");
-        require(admin != guardian, "admin=guardian");
-        require(admin != initialSigner, "admin=signer");
-        require(windowMintCap > 0 && perTxMax > 0 && perTxMax <= windowMintCap, "bad caps");
-        require(windowMintCap <= bondBackingCapLimit / 2, "backing must cover 2x window");
-        require(epochSeconds > 0 && rotateTimelock > 0, "zero delay/window");
-        require(beldexNetwork <= 2, "bad Beldex network");
-        require(minRedeemAmount > 0 && minRedeemAmount <= perTxMax, "bad redeem minimum");
+        require(config.admin.code.length > 0, "ADMIN must be a contract");
+        require(config.guardian != address(0) && config.guardian != config.signer, "bad GUARDIAN");
+        require(config.admin != config.guardian, "admin=guardian");
+        require(config.admin != config.signer, "admin=signer");
+        require(
+            config.windowCap > 0 && config.txMax > 0 && config.txMax <= config.windowCap, "bad caps"
+        );
+        require(config.windowCap <= config.backing / 2, "backing must cover 2x window");
+        require(config.epochSeconds > 0 && config.rotationDelay > 0, "zero delay/window");
+        require(config.network <= 2, "bad Beldex network");
+        require(config.minimum > 0 && config.minimum <= config.txMax, "bad redeem minimum");
+
+        uint256 redemptionFee = vm.envUint("REDEMPTION_FEE");
+        require(
+            config.minimum > redemptionFee && config.minimum <= 50_000 * 1e9,
+            "bad redemption fee/minimum"
+        );
 
         vm.startBroadcast();
 
         WrappedBDX impl = new WrappedBDX();
-        bytes memory init = abi.encodeCall(
-            WrappedBDX.initializeForNetwork,
-            (
-                admin,
-                guardian,
-                initialSigner,
-                windowMintCap,
-                perTxMax,
-                bondBackingCapLimit,
-                epochSeconds,
-                rotateTimelock,
-                beldexNetwork,
-                minRedeemAmount
-            )
-        );
+        bytes memory init =
+            abi.encodeCall(WrappedBDX.initializeForNetworkWithFee, (config, redemptionFee));
         ERC1967Proxy proxy = new ERC1967Proxy(address(impl), init);
 
         vm.stopBroadcast();

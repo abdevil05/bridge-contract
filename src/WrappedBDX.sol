@@ -39,7 +39,7 @@ import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 /// exact event the E.2 EVM watcher (`evm_watcher.rs`) decodes: `from` indexed, and
 /// `abi.encode(amount, beldexAddress)` in the data. The *release* cap that mirrors the
 /// mint cap lives on the L1 gateway in consensus (Phase A.3), since releases move locked
-/// BDX, not wBDX; the contract bounds a burn only by `perTxMax` for UX.
+/// BDX, not wBDX; the contract also enforces the native debit maximum and a positive payout after fees.
 ///
 /// ## Decimals
 /// 9 decimals to match Beldex `COIN = 10^9`, so 1 wBDX unit == 1 atomic BDX — no
@@ -111,6 +111,11 @@ contract WrappedBDX is Initializable, ERC20Upgradeable, PausableUpgradeable, UUP
     /// @notice Smallest native redemption. This bounds permanent L1 replay-index growth
     ///         from dust burns; existing proxies may set it through `initializeV3`.
     uint256 public minRedeemAmount;
+    /// @notice Native consensus maximum debit, including fee (50,000 BDX).
+    uint256 public constant NATIVE_RELEASE_MAX = 50_000 * 1e9;
+    /// @notice Fixed fee for this deployment; changing it requires a reviewed upgrade.
+    uint256 public redemptionFee;
+    bool public redemptionFeeInitialized;
 
     // --- Events ----------------------------------------------------------------------
     event Minted(
@@ -160,6 +165,8 @@ contract WrappedBDX is Initializable, ERC20Upgradeable, PausableUpgradeable, UUP
     error BadRedeemAddress();
     error ZeroAmount();
     error BelowMinimumRedeem();
+    error RedemptionNotConfigured();
+    event RedemptionFeeInitialized(uint256 fee);
     error NotGuardianOrAdmin();
     error NotPendingAdmin();
 
@@ -196,18 +203,18 @@ contract WrappedBDX is Initializable, ERC20Upgradeable, PausableUpgradeable, UUP
         uint256 epochSeconds_,
         uint256 rotateTimelock_
     ) external initializer {
-        _initialize(
-            admin_,
-            guardian_,
-            initialSigner,
-            windowMintCap_,
-            perTxMax_,
-            bondBackingCapLimit_,
-            epochSeconds_,
-            rotateTimelock_,
-            BELDEX_MAINNET,
-            1
-        );
+        InitializationConfig memory config;
+        config.admin = admin_;
+        config.guardian = guardian_;
+        config.signer = initialSigner;
+        config.windowCap = windowMintCap_;
+        config.txMax = perTxMax_;
+        config.backing = bondBackingCapLimit_;
+        config.epochSeconds = epochSeconds_;
+        config.rotationDelay = rotateTimelock_;
+        config.network = BELDEX_MAINNET;
+        config.minimum = 1;
+        _initialize(config);
     }
 
     /// @notice Network-aware initializer for non-mainnet deployments. Keeping this as a
@@ -225,43 +232,85 @@ contract WrappedBDX is Initializable, ERC20Upgradeable, PausableUpgradeable, UUP
         uint8 beldexNetwork_,
         uint256 minRedeemAmount_
     ) external initializer {
-        _initialize(
-            admin_,
-            guardian_,
-            initialSigner,
-            windowMintCap_,
-            perTxMax_,
-            bondBackingCapLimit_,
-            epochSeconds_,
-            rotateTimelock_,
-            beldexNetwork_,
-            minRedeemAmount_
-        );
+        InitializationConfig memory config;
+        config.admin = admin_;
+        config.guardian = guardian_;
+        config.signer = initialSigner;
+        config.windowCap = windowMintCap_;
+        config.txMax = perTxMax_;
+        config.backing = bondBackingCapLimit_;
+        config.epochSeconds = epochSeconds_;
+        config.rotationDelay = rotateTimelock_;
+        config.network = beldexNetwork_;
+        config.minimum = minRedeemAmount_;
+        _initialize(config);
     }
 
-    function _initialize(
-        address admin_,
-        address guardian_,
-        address initialSigner,
-        uint256 windowMintCap_,
-        uint256 perTxMax_,
-        uint256 bondBackingCapLimit_,
-        uint256 epochSeconds_,
-        uint256 rotateTimelock_,
-        uint8 beldexNetwork_,
-        uint256 minRedeemAmount_
-    ) internal {
-        if (admin_ == address(0) || guardian_ == address(0) || initialSigner == address(0)) {
+    struct InitializationConfig {
+        address admin;
+        address guardian;
+        address signer;
+        uint256 windowCap;
+        uint256 txMax;
+        uint256 backing;
+        uint256 epochSeconds;
+        uint256 rotationDelay;
+        uint8 network;
+        uint256 minimum;
+    }
+
+    /// @notice Atomic initialization of network policy and the fixed native payout fee.
+    function initializeForNetworkWithFee(InitializationConfig memory config, uint256 fee_)
+        external
+        initializer
+    {
+        _initialize(config);
+        _initializeRedemptionFee(fee_);
+    }
+
+    /// @notice Configure an existing proxy atomically with upgradeToAndCall.
+    /// Set a suitable minimum first if the legacy minimum does not exceed the fee.
+    function initializeV4(uint256 fee_) external reinitializer(4) onlyAdmin {
+        if (guardian == address(0)) revert InvalidConfiguration();
+        _initializeRedemptionFee(fee_);
+    }
+
+    function _initializeRedemptionFee(uint256 fee_) internal {
+        if (
+            redemptionFeeInitialized || fee_ >= minRedeemAmount
+                || minRedeemAmount > NATIVE_RELEASE_MAX || minRedeemAmount > perTxMax
+        ) {
+            revert InvalidConfiguration();
+        }
+        redemptionFee = fee_;
+        redemptionFeeInitialized = true;
+        emit RedemptionFeeInitialized(fee_);
+    }
+
+    function _initialize(InitializationConfig memory config) internal {
+        if (
+            config.admin == address(0) || config.guardian == address(0)
+                || config.signer == address(0)
+        ) {
             revert ZeroAddress();
         }
-        if (admin_ == guardian_ || admin_ == initialSigner || guardian_ == initialSigner) {
+        if (
+            config.admin == config.guardian || config.admin == config.signer
+                || config.guardian == config.signer
+        ) {
             revert InvalidConfiguration();
         }
         _validateConfiguration(
-            windowMintCap_, perTxMax_, bondBackingCapLimit_, epochSeconds_, rotateTimelock_
+            config.windowCap,
+            config.txMax,
+            config.backing,
+            config.epochSeconds,
+            config.rotationDelay
         );
-        if (beldexNetwork_ > BELDEX_DEVNET || minRedeemAmount_ == 0 || minRedeemAmount_ > perTxMax_)
-        {
+        if (
+            config.network > BELDEX_DEVNET || config.minimum == 0 || config.minimum > config.txMax
+                || config.minimum > NATIVE_RELEASE_MAX
+        ) {
             revert InvalidConfiguration();
         }
 
@@ -270,26 +319,26 @@ contract WrappedBDX is Initializable, ERC20Upgradeable, PausableUpgradeable, UUP
         // NOTE: OZ upgradeable v5 removed __UUPSUpgradeable_init() -- UUPSUpgradeable
         // is stateless there; inheriting + overriding _authorizeUpgrade is sufficient.
 
-        admin = admin_;
-        guardian = guardian_;
-        currentSigner = initialSigner;
+        admin = config.admin;
+        guardian = config.guardian;
+        currentSigner = config.signer;
         keyEpoch = 1;
-        windowMintCap = windowMintCap_;
-        perTxMax = perTxMax_;
-        bondBackingCapLimit = bondBackingCapLimit_;
-        epochSeconds = epochSeconds_;
-        rotateTimelock = rotateTimelock_;
-        beldexNetwork = beldexNetwork_;
-        minRedeemAmount = minRedeemAmount_;
-        windowId = block.timestamp / epochSeconds_;
+        windowMintCap = config.windowCap;
+        perTxMax = config.txMax;
+        bondBackingCapLimit = config.backing;
+        epochSeconds = config.epochSeconds;
+        rotateTimelock = config.rotationDelay;
+        beldexNetwork = config.network;
+        minRedeemAmount = config.minimum;
+        windowId = block.timestamp / config.epochSeconds;
 
-        emit AdminTransferred(address(0), admin_);
-        emit GuardianSet(address(0), guardian_);
-        emit Rotated(initialSigner, 1);
-        emit CapsSet(windowMintCap_, perTxMax_);
-        emit BondBackingCapLimitSet(bondBackingCapLimit_);
-        emit BeldexNetworkSet(beldexNetwork_);
-        emit MinimumRedeemAmountSet(minRedeemAmount_);
+        emit AdminTransferred(address(0), config.admin);
+        emit GuardianSet(address(0), config.guardian);
+        emit Rotated(config.signer, 1);
+        emit CapsSet(config.windowCap, config.txMax);
+        emit BondBackingCapLimitSet(config.backing);
+        emit BeldexNetworkSet(config.network);
+        emit MinimumRedeemAmountSet(config.minimum);
     }
 
     /// @notice Atomic migration hook for proxies deployed with the V1 initializer.
@@ -321,8 +370,11 @@ contract WrappedBDX is Initializable, ERC20Upgradeable, PausableUpgradeable, UUP
         reinitializer(3)
         onlyAdmin
     {
-        if (beldexNetwork_ > BELDEX_DEVNET || minRedeemAmount_ == 0 || minRedeemAmount_ > perTxMax)
-        {
+        if (
+            beldexNetwork_ > BELDEX_DEVNET || minRedeemAmount_ == 0 || minRedeemAmount_ > perTxMax
+                || minRedeemAmount_ > NATIVE_RELEASE_MAX
+                || (redemptionFeeInitialized && minRedeemAmount_ <= redemptionFee)
+        ) {
             revert InvalidConfiguration();
         }
         // A legacy V1 proxy must run initializeV2 first; calling V3 out of order would
@@ -438,9 +490,10 @@ contract WrappedBDX is Initializable, ERC20Upgradeable, PausableUpgradeable, UUP
     ///         CryptoNote checksum before the irreversible burn. Only standard addresses
     ///         are supported by the native gateway payout builder.
     function redeemToNative(uint256 amount, string calldata beldexAddress) external whenNotPaused {
+        if (!redemptionFeeInitialized) revert RedemptionNotConfigured();
         if (amount == 0) revert ZeroAmount();
-        if (amount < minRedeemAmount) revert BelowMinimumRedeem();
-        if (amount > perTxMax) revert PerTxCap();
+        if (amount < minRedeemAmount || amount <= redemptionFee) revert BelowMinimumRedeem();
+        if (amount > perTxMax || amount > NATIVE_RELEASE_MAX) revert PerTxCap();
         bytes memory addr = bytes(beldexAddress);
         if (!_isValidBeldexAddress(addr, beldexNetwork)) revert BadRedeemAddress();
 
@@ -734,7 +787,10 @@ contract WrappedBDX is Initializable, ERC20Upgradeable, PausableUpgradeable, UUP
     }
 
     function setMinimumRedeemAmount(uint256 newMinimum) external onlyAdmin {
-        if (newMinimum == 0 || newMinimum > perTxMax) revert InvalidConfiguration();
+        if (
+            newMinimum == 0 || newMinimum > perTxMax || newMinimum > NATIVE_RELEASE_MAX
+                || (redemptionFeeInitialized && newMinimum <= redemptionFee)
+        ) revert InvalidConfiguration();
         minRedeemAmount = newMinimum;
         emit MinimumRedeemAmountSet(newMinimum);
     }
@@ -779,5 +835,5 @@ contract WrappedBDX is Initializable, ERC20Upgradeable, PausableUpgradeable, UUP
     ///      use ERC-7201 namespaced storage and need no gap).
     // `rotationNonce` packs into the unused bytes of the preceding `pendingAdmin`
     // address slot, so adding it does not consume a gap slot.
-    uint256[35] private __gap;
+    uint256[33] private __gap;
 }
