@@ -2,6 +2,7 @@
 pragma solidity 0.8.24;
 
 import { Test } from "forge-std/Test.sol";
+import { stdStorage, StdStorage } from "forge-std/StdStorage.sol";
 import { WrappedBDX } from "../src/WrappedBDX.sol";
 import { ERC1967Proxy } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {
@@ -30,6 +31,7 @@ contract WrappedBDXAddressHarness is WrappedBDX {
 }
 
 contract WrappedBDXTest is Test {
+    using stdStorage for StdStorage;
     WrappedBDX internal w;
 
     address internal admin = address(0xA11CE);
@@ -42,6 +44,7 @@ contract WrappedBDXTest is Test {
     uint256 internal committeePk = 0xC0FFEE;
     address internal committee;
 
+    uint256 internal constant RELAY_FEE = 30_000_000;
     uint256 internal constant COIN = 1e9; // 9 decimals
     uint256 internal constant WINDOW_CAP = 1_000_000 * COIN;
     uint256 internal constant PER_TX_MAX = 100_000 * COIN;
@@ -73,9 +76,9 @@ contract WrappedBDXTest is Test {
                     EPOCH_SECONDS,
                     ROTATE_TIMELOCK,
                     0,
-                    1
+                    RELAY_FEE + 1
                 ),
-                uint256(0)
+                RELAY_FEE
             )
         );
         w = WrappedBDX(address(new ERC1967Proxy(address(impl), init)));
@@ -378,36 +381,36 @@ contract WrappedBDXTest is Test {
     }
 
     function test_Redeem_feeMustLeavePositivePayout() public {
-        WrappedBDX token = _feeToken(101, 100);
-        deal(address(token), alice, 1000, true);
-        for (uint256 amount = 99; amount <= 100; ++amount) {
+        WrappedBDX token = _feeToken(RELAY_FEE + 1, RELAY_FEE);
+        deal(address(token), alice, COIN, true);
+        for (uint256 amount = RELAY_FEE - 1; amount <= RELAY_FEE; ++amount) {
             vm.prank(alice);
             vm.expectRevert(WrappedBDX.BelowMinimumRedeem.selector);
             token.redeemToNative(amount, VALID_BDX_ADDRESS);
-            assertEq(token.balanceOf(alice), 1000);
-            assertEq(token.totalSupply(), 1000);
+            assertEq(token.balanceOf(alice), COIN);
+            assertEq(token.totalSupply(), COIN);
         }
         vm.prank(alice);
-        token.redeemToNative(101, VALID_BDX_ADDRESS);
-        assertEq(token.balanceOf(alice), 899);
+        token.redeemToNative(RELAY_FEE + 1, VALID_BDX_ADDRESS);
+        assertEq(token.balanceOf(alice), COIN - RELAY_FEE - 1);
     }
 
     function test_Redeem_configurationCannotInvalidateFeeOrMinimum() public {
-        WrappedBDX token = _feeToken(101, 100);
+        WrappedBDX token = _feeToken(RELAY_FEE + 1, RELAY_FEE);
         uint256 maximum = token.NATIVE_RELEASE_MAX();
         vm.startPrank(admin);
         vm.expectRevert(WrappedBDX.InvalidConfiguration.selector);
-        token.setMinimumRedeemAmount(100);
+        token.setMinimumRedeemAmount(RELAY_FEE);
         vm.expectRevert(WrappedBDX.InvalidConfiguration.selector);
         token.setMinimumRedeemAmount(maximum + 1);
         vm.expectRevert(WrappedBDX.InvalidConfiguration.selector);
-        token.setCaps(WINDOW_CAP, 100);
+        token.setCaps(WINDOW_CAP, RELAY_FEE);
         vm.expectRevert(WrappedBDX.InvalidConfiguration.selector);
-        token.initializeV4(101); // cannot replace an already established fee
+        token.initializeV4(RELAY_FEE + 1); // cannot replace an already established fee
         vm.expectRevert(WrappedBDX.InvalidConfiguration.selector);
-        token.initializeV3(0, 100); // older migration entrypoint cannot bypass minimum
+        token.initializeV3(0, RELAY_FEE); // older migration entrypoint cannot bypass minimum
         vm.stopPrank();
-        assertEq(token.redemptionFee(), 100);
+        assertEq(token.redemptionFee(), RELAY_FEE);
     }
 
     function test_Redeem_legacyInitializerRequiresExplicitFeeMigration() public {
@@ -440,24 +443,58 @@ contract WrappedBDXTest is Test {
         token.initializeV4(0);
         vm.startPrank(admin);
         vm.expectRevert(WrappedBDX.InvalidConfiguration.selector);
-        token.initializeV4(100); // initial minimum is 1
-        token.setMinimumRedeemAmount(101);
-        token.initializeV4(100);
+        token.initializeV4(RELAY_FEE); // initial minimum is 1
+        token.setMinimumRedeemAmount(RELAY_FEE + 1);
+        for (uint256 i = 0; i < 3; ++i) {
+            uint256 fee = i == 0 ? 0 : (i == 1 ? 1 : RELAY_FEE - 1);
+            vm.expectRevert(WrappedBDX.InvalidConfiguration.selector);
+            token.initializeV4(fee);
+            assertFalse(token.redemptionFeeInitialized());
+        }
+        token.initializeV4(RELAY_FEE);
         vm.stopPrank();
         assertTrue(token.redemptionFeeInitialized());
         vm.prank(alice);
-        token.redeemToNative(101, VALID_BDX_ADDRESS);
+        token.redeemToNative(RELAY_FEE + 1, VALID_BDX_ADDRESS);
     }
 
     function test_Redeem_badFeeConfigurationRejectedAtDeployment() public {
         // Call through this test contract so the expectation encloses the entire creation.
         vm.expectRevert(WrappedBDX.InvalidConfiguration.selector);
-        this.deployFeeToken(100, 100);
+        this.deployFeeToken(RELAY_FEE, RELAY_FEE);
         vm.expectRevert(WrappedBDX.InvalidConfiguration.selector);
-        this.deployFeeToken(100, 101);
+        this.deployFeeToken(RELAY_FEE, RELAY_FEE + 1);
         uint256 maximum = w.NATIVE_RELEASE_MAX();
         vm.expectRevert(WrappedBDX.InvalidConfiguration.selector);
-        this.deployFeeToken(maximum + 1, 100);
+        this.deployFeeToken(maximum + 1, RELAY_FEE);
+    }
+
+    function test_Redeem_relayFeeFloorRejectsZeroAndInsufficientFees() public {
+        for (uint256 i = 0; i < 3; ++i) {
+            uint256 fee = i == 0 ? 0 : (i == 1 ? 1 : RELAY_FEE - 1);
+            vm.expectRevert(WrappedBDX.InvalidConfiguration.selector);
+            this.deployFeeToken(COIN, fee);
+        }
+        WrappedBDX token = _feeToken(RELAY_FEE + 1, RELAY_FEE);
+        assertEq(token.MIN_REDEMPTION_FEE(), RELAY_FEE);
+        deal(address(token), alice, COIN, true);
+        vm.prank(alice);
+        token.redeemToNative(RELAY_FEE + 1, VALID_BDX_ADDRESS);
+        assertEq(token.balanceOf(alice), COIN - RELAY_FEE - 1);
+    }
+
+    function test_Redeem_legacyUnderfundedFeeCannotBurnAfterUpgrade() public {
+        deal(address(w), alice, COIN, true);
+        // Simulate storage inherited from an older implementation that accepted low fees.
+        for (uint256 i = 0; i < 3; ++i) {
+            uint256 fee = i == 0 ? 0 : (i == 1 ? 1 : RELAY_FEE - 1);
+            stdstore.target(address(w)).sig("redemptionFee()").checked_write(fee);
+            vm.prank(alice);
+            vm.expectRevert(WrappedBDX.RedemptionNotConfigured.selector);
+            w.redeemToNative(COIN, VALID_BDX_ADDRESS);
+            assertEq(w.balanceOf(alice), COIN);
+            assertEq(w.totalSupply(), COIN);
+        }
     }
 
     function deployFeeToken(uint256 minimum, uint256 fee) external returns (WrappedBDX) {
@@ -550,7 +587,7 @@ contract WrappedBDXTest is Test {
         );
         WrappedBDX token = WrappedBDX(address(new ERC1967Proxy(address(impl), init)));
         vm.prank(admin);
-        token.initializeV4(0);
+        token.initializeV4(RELAY_FEE);
         return token;
     }
 
@@ -640,7 +677,7 @@ contract WrappedBDXTest is Test {
         );
         WrappedBDX dev = WrappedBDX(address(new ERC1967Proxy(address(devImpl), init)));
         vm.prank(admin);
-        dev.initializeV4(0);
+        dev.initializeV4(RELAY_FEE);
         assertEq(dev.beldexNetwork(), dev.BELDEX_DEVNET());
         assertEq(dev.minRedeemAmount(), COIN);
 

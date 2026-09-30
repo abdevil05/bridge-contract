@@ -140,3 +140,20 @@ signers read the fixed fee from finalized contract state, build payouts using
 that fee, and refuse conflicting local settings. An unconfigured/old contract
 causes startup to fail closed. The contract and signer changes have not been
 deployed by this repository edit.
+
+### Native payout fee floor (HF23)
+
+`REDEMPTION_FEE` / `redemptionFee` must be at least **30,000,000 atomic BDX
+(0.03 BDX)**; `MIN_REDEEM_AMOUNT` must be strictly greater than the chosen fee.
+Initialization, V4 migration, and the burn entrypoint enforce this floor.
+It covers the maximum current ordinary native relay fee for the supported
+single-recipient payout (two stealth outputs, at most 4096 transaction weight),
+including the release reference and owner signature. The daemon additionally
+checks the actual relay fee before construction/admission by the signer.
+
+The floor matches `GATEWAY_RELEASE_MIN_FEE` and signer `MIN_REDEMPTION_FEE`.
+Native fee-rule or payout-format changes require reviewing all three bounds.
+An existing proxy with an underfunded fee must pause redemptions and undergo a
+reviewed migration; upgrading to this implementation blocks further burns with
+that configuration. Previously burned requests need separate recovery and are
+not automatically repaired by these source changes.

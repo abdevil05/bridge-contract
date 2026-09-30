@@ -113,6 +113,10 @@ contract WrappedBDX is Initializable, ERC20Upgradeable, PausableUpgradeable, UUP
     uint256 public minRedeemAmount;
     /// @notice Native consensus maximum debit, including fee (50,000 BDX).
     uint256 public constant NATIVE_RELEASE_MAX = 50_000 * 1e9;
+    /// @notice HF23 ordinary relay budget for a <=4096-weight, two-output native payout.
+    /// Worst-case fee is 6666/weight + 100000/output; includes quantization headroom.
+    /// Must match GATEWAY_RELEASE_MIN_FEE and signer redemption_limits.
+    uint256 public constant MIN_REDEMPTION_FEE = 30_000_000; // 0.03 BDX
     /// @notice Fixed fee for this deployment; changing it requires a reviewed upgrade.
     uint256 public redemptionFee;
     bool public redemptionFeeInitialized;
@@ -277,7 +281,7 @@ contract WrappedBDX is Initializable, ERC20Upgradeable, PausableUpgradeable, UUP
 
     function _initializeRedemptionFee(uint256 fee_) internal {
         if (
-            redemptionFeeInitialized || fee_ >= minRedeemAmount
+            redemptionFeeInitialized || fee_ < MIN_REDEMPTION_FEE || fee_ >= minRedeemAmount
                 || minRedeemAmount > NATIVE_RELEASE_MAX || minRedeemAmount > perTxMax
         ) {
             revert InvalidConfiguration();
@@ -490,7 +494,9 @@ contract WrappedBDX is Initializable, ERC20Upgradeable, PausableUpgradeable, UUP
     ///         CryptoNote checksum before the irreversible burn. Only standard addresses
     ///         are supported by the native gateway payout builder.
     function redeemToNative(uint256 amount, string calldata beldexAddress) external whenNotPaused {
-        if (!redemptionFeeInitialized) revert RedemptionNotConfigured();
+        if (!redemptionFeeInitialized || redemptionFee < MIN_REDEMPTION_FEE) {
+            revert RedemptionNotConfigured();
+        }
         if (amount == 0) revert ZeroAmount();
         if (amount < minRedeemAmount || amount <= redemptionFee) revert BelowMinimumRedeem();
         if (amount > perTxMax || amount > NATIVE_RELEASE_MAX) revert PerTxCap();
@@ -836,4 +842,4 @@ contract WrappedBDX is Initializable, ERC20Upgradeable, PausableUpgradeable, UUP
     // `rotationNonce` packs into the unused bytes of the preceding `pendingAdmin`
     // address slot, so adding it does not consume a gap slot.
     uint256[33] private __gap;
-}
+    }

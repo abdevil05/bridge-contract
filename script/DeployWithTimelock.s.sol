@@ -47,7 +47,8 @@ contract DeployWithTimelock is Script {
 
         uint256 redemptionFee = vm.envUint("REDEMPTION_FEE");
         require(
-            config.minimum > redemptionFee && config.minimum <= 50_000 * 1e9,
+            redemptionFee >= 30_000_000 && config.minimum > redemptionFee
+                && config.minimum <= 50_000 * 1e9,
             "bad redemption fee/minimum"
         );
 
